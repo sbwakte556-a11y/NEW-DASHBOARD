@@ -366,8 +366,39 @@ if sel_str:
     ce_row = s[s.option_type == "CE"].squeeze() if not s[s.option_type == "CE"].empty else None
     pe_row = s[s.option_type == "PE"].squeeze() if not s[s.option_type == "PE"].empty else None
 
-    def safe_val(row, col):
-        return float(row[col]) if (row is not None and col in row and pd.notna(row[col])) else 0.0
+    
+def safe_val(row, col, default=0.0):
+    """Safely extract a scalar float from row[col].
+    Supports dict, pandas Series, and single-row DataFrames.
+    Returns `default` if missing/NaN; if a Series is found, uses the first non-NaN scalar.
+    """
+    try:
+        if row is None:
+            return float(default)
+        # dict-like
+        if isinstance(row, dict):
+            v = row.get(col, default)
+        # pandas Series
+        elif hasattr(row, 'index') and not hasattr(row, 'columns'):
+            v = row[col] if col in row.index else default
+        # pandas DataFrame (take the first row's value for this column)
+        elif hasattr(row, 'columns'):
+            if col in row.columns and len(row) > 0:
+                v = row.iloc[0][col]
+            else:
+                v = default
+        else:
+            # fallback: attribute access
+            v = getattr(row, col, default)
+        # If v is a Series or array, take first valid
+        if hasattr(v, '__array__') or str(type(v)).endswith("Series'>"):
+            try:
+                v = next((x for x in np.ravel(v) if pd.notna(x)), default)
+            except Exception:
+                v = default
+        return float(v) if (v is not None and pd.notna(v)) else float(default)
+    except Exception:
+        return float(default)
 
     ce_oi = safe_val(ce_row, "oi");        pe_oi = safe_val(pe_row, "oi")
     ce_prev_oi = safe_val(ce_row, "prev_oi"); pe_prev_oi = safe_val(pe_row, "prev_oi")
@@ -627,3 +658,156 @@ with st.expander("🔎 Raw Latest Snapshot"):
 
 st.markdown("---")
 st.caption("This online dashboard fetches NSE option-chain live and refreshes automatically. Intraday trends are from in-session history only. Use with caution.")
+
+
+
+# ---------- Feature helpers ----------
+def get_atm_strike(spot, step):
+    try:
+        return int(round(spot / step) * step)
+    except Exception:
+        return np.nan
+
+def subset_atm_band(df_wide, atm, k, step):
+    if pd.isna(atm):
+        return df_wide.copy()
+    lo = atm - k*step
+    hi = atm + k*step
+    return df_wide[(df_wide['strike'] >= lo) & (df_wide['strike'] <= hi)].copy()
+
+def build_atm_band_table(wide_latest, k, step):
+    cols = ['strike','ce_oi','pe_oi','ce_oi_chg','pe_oi_chg','ce_ltp','pe_ltp','ce_buildup','pe_buildup']
+    have = [c for c in cols if c in wide_latest.columns]
+    tbl = wide_latest[have].copy()
+    # per-strike totals and PCR
+    if all(c in tbl.columns for c in ['ce_oi','pe_oi']):
+        tbl['pcr'] = (tbl['pe_oi'] / tbl['ce_oi']).replace([np.inf, -np.inf], np.nan)
+    # rename for display
+    disp = tbl.rename(columns={
+        'ce_oi':'CE OI','pe_oi':'PE OI',
+        'ce_oi_chg':'CE OI Δ','pe_oi_chg':'PE OI Δ',
+        'ce_ltp':'CE LTP','pe_ltp':'PE LTP',
+        'ce_buildup':'CE Buildup','pe_buildup':'PE Buildup'
+    })
+    # totals
+    totals = {
+        'strike':'TOTAL',
+        'CE OI': disp['CE OI'].sum() if 'CE OI' in disp else np.nan,
+        'PE OI': disp['PE OI'].sum() if 'PE OI' in disp else np.nan,
+        'CE OI Δ': disp['CE OI Δ'].sum() if 'CE OI Δ' in disp else np.nan,
+        'PE OI Δ': disp['PE OI Δ'].sum() if 'PE OI Δ' in disp else np.nan,
+    }
+    disp_total = pd.concat([disp, pd.DataFrame([totals])], ignore_index=True)
+    return disp_total
+
+def top_trending_strikes(wide_latest, n=5):
+    # rank by absolute OI change on both sides
+    if not all(c in wide_latest.columns for c in ['ce_oi_chg','pe_oi_chg','strike']):
+        return pd.DataFrame()
+    t = wide_latest[['strike','ce_oi_chg','pe_oi_chg']].copy()
+    t['abs_oi_chg'] = (t['ce_oi_chg'].fillna(0).abs() + t['pe_oi_chg'].fillna(0).abs())
+    t = t.sort_values('abs_oi_chg', ascending=False).head(n)
+    return t[['strike','ce_oi_chg','pe_oi_chg','abs_oi_chg']].rename(columns={'ce_oi_chg':'CE OI Δ','pe_oi_chg':'PE OI Δ','abs_oi_chg':'Total |ΔOI|'})
+
+def strikewise_pcr(wide_latest):
+    if not all(c in wide_latest.columns for c in ['ce_oi','pe_oi','strike']):
+        return pd.DataFrame()
+    df = wide_latest[['strike','ce_oi','pe_oi']].copy()
+    df['PCR'] = (df['pe_oi'] / df['ce_oi']).replace([np.inf, -np.inf], np.nan)
+    return df[['strike','ce_oi','pe_oi','PCR']].rename(columns={'ce_oi':'CE OI','pe_oi':'PE OI'})
+
+def session_vwap(history_wide, side='ce'):
+    # compute per-strike VWAP using session history: sum(price*vol)/sum(vol)
+    price_col = f"{side}_ltp"
+    vol_col = f"{side}_vol" if f"{side}_vol" in history_wide.columns else None
+    if vol_col is None or price_col not in history_wide.columns:
+        return pd.Series(dtype=float)
+    hv = history_wide.dropna(subset=['strike']).copy()
+    hv['pv'] = hv[price_col].fillna(0) * hv[vol_col].fillna(0)
+    grp = hv.groupby('strike', as_index=True)
+    vwap = grp['pv'].sum() / grp[vol_col].sum().replace(0, np.nan)
+    return vwap
+
+def last_3min_delta(history_wide):
+    # Use last two snapshots spaced by ~3 minutes; if timestamps exist, pick two latest
+    if history_wide.empty or 'ts' not in history_wide.columns:
+        return {}
+    h = history_wide.sort_values('ts')
+    last = h['ts'].max()
+    prev = h[h['ts'] < last]['ts'].max()
+    if pd.isna(prev):
+        return {}
+    d = {}
+    for col in ['ce_oi','pe_oi','ce_oi_chg','pe_oi_chg']:
+        if col in h.columns:
+            v_last = h[h['ts']==last][col].sum()
+            v_prev = h[h['ts']==prev][col].sum()
+            d[col] = float(v_last - v_prev)
+    return d
+
+
+
+
+# ---------- New Feature Sections ----------
+try:
+    # Determine ATM and band subset
+    step = STRIKE_STEP if 'STRIKE_STEP' in globals() else 50
+    k = near_strikes if 'near_strikes' in globals() else 3
+    spot = float(wide_latest['spot'].iloc[0]) if 'spot' in wide_latest.columns else np.nan
+    atm = get_atm_strike(spot, step)
+    band = subset_atm_band(wide_latest, atm, k, step)
+
+    # 1) ATM±k table with totals (Trending OI = sum of |CE OI Δ| + |PE OI Δ| in band)
+    st.subheader(f"ATM±{k} Strikes Summary (ATM ≈ {atm})")
+    atm_tbl = build_atm_band_table(band, k, step)
+    if 'CE OI Δ' in atm_tbl.columns and 'PE OI Δ' in atm_tbl.columns:
+        trending_oi = float(atm_tbl.iloc[:-1]['CE OI Δ'].abs().sum() + atm_tbl.iloc[:-1]['PE OI Δ'].abs().sum())
+        st.caption(f"Trending OI (band): {int(trending_oi):,}")
+    st.dataframe(atm_tbl, use_container_width=True)
+
+    # 2) Top trending strikes by |ΔOI|
+    st.subheader("Top Trending Strikes (by |ΔOI|)")
+    top_tr = top_trending_strikes(wide_latest, n=8)
+    if not top_tr.empty:
+        st.dataframe(top_tr, use_container_width=True)
+    else:
+        st.info("Insufficient fields to compute trending strikes.")
+
+    # 3) Strike-wise PCR
+    st.subheader("Strike-wise PCR")
+    pcr_tbl = strikewise_pcr(wide_latest)
+    if not pcr_tbl.empty:
+        st.dataframe(pcr_tbl, use_container_width=True)
+    else:
+        st.info("Insufficient fields for PCR.")
+
+    # 4) CE/PE side-by-side with session VWAP and line chart markers (above/below VWAP)
+    st.subheader("CE vs PE with Session VWAP (above/below)")
+    # Compute VWAP from session history if available
+    vw_ce = session_vwap(st.session_state.get('history_wide', pd.DataFrame()), side='ce')
+    vw_pe = session_vwap(st.session_state.get('history_wide', pd.DataFrame()), side='pe')
+    combo = wide_latest[['strike','ce_ltp','pe_ltp']].copy() if set(['strike','ce_ltp','pe_ltp']).issubset(wide_latest.columns) else pd.DataFrame()
+    if not combo.empty:
+        combo['CE VWAP'] = combo['strike'].map(vw_ce)
+        combo['PE VWAP'] = combo['strike'].map(vw_pe)
+        combo['CE vs VWAP'] = np.where(combo['ce_ltp'] > combo['CE VWAP'], 'Above', 'Below')
+        combo['PE vs VWAP'] = np.where(combo['pe_ltp'] > combo['PE VWAP'], 'Above', 'Below')
+        st.dataframe(combo.rename(columns={'ce_ltp':'CE LTP','pe_ltp':'PE LTP'}), use_container_width=True)
+        st.caption("Tip: Strikes marked 'Above' may indicate strength vs. session average price.")
+    else:
+        st.info("Need LTP columns to compute VWAP markers.")
+
+    # 5) Three-line detail from last ~3 minutes OI delta
+    deltas = last_3min_delta(st.session_state.get('history_wide', pd.DataFrame()))
+    if deltas:
+        line1 = f"CE OI Δ (≈3m): {int(deltas.get('ce_oi',0)):,} | PE OI Δ (≈3m): {int(deltas.get('pe_oi',0)):,}"
+        line2 = f"CE |ΔOI| (≈3m): {int(abs(deltas.get('ce_oi_chg',0))):,} | PE |ΔOI| (≈3m): {int(abs(deltas.get('pe_oi_chg',0))):,}"
+        bias = 'Bullish' if deltas.get('pe_oi',0) > deltas.get('ce_oi',0) else 'Bearish' if deltas.get('ce_oi',0) > deltas.get('pe_oi',0) else 'Neutral'
+        line3 = f"Bias: {bias} (based on relative OI increase)"
+        st.markdown(f"**Quick 3-min Take:**  "+line1+"  "+line2+"  "+line3)
+    else:
+        st.caption("Waiting for at least two snapshots to compute 3‑minute deltas.")
+
+except Exception as e:
+    st.warning(f"Feature section error: {e}")
+
