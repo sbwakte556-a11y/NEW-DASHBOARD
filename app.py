@@ -108,7 +108,6 @@ def fetch_option_chain(symbol: str = SYMBOL, tries: int = 5, backoff: float = 1.
 def nearest_strike(price: float, step: int = STRIKE_STEP) -> int:
     return int(round(price / step) * step)
 
-
 def classify_buildup(oi_change: float, ltp_change: float) -> str:
     if pd.isna(oi_change) or pd.isna(ltp_change):
         return "Neutral"
@@ -121,7 +120,6 @@ def classify_buildup(oi_change: float, ltp_change: float) -> str:
     if oi_change < 0 and ltp_change > 0:
         return "Short Covering"
     return "Neutral"
-
 
 def enrich_with_prev(curr: pd.DataFrame, prev: Optional[pd.DataFrame]) -> pd.DataFrame:
     if curr.empty:
@@ -141,7 +139,6 @@ def enrich_with_prev(curr: pd.DataFrame, prev: Optional[pd.DataFrame]) -> pd.Dat
     df["ltp_chg_pct"] = np.where(df["prev_ltp"] > 0, 100 * df["ltp_chg"] / df["prev_ltp"], 0.0)
     df["buildup"] = [classify_buildup(o, p) for o, p in zip(df["oi_chg"], df["ltp_chg"])]
     return df
-
 
 def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
     keep = ["strike", "option_type", "oi", "ltp", "spot", "ts"]
@@ -166,7 +163,6 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
     wide["ce_ltp_chg"] = wide.groupby("strike")["ce_ltp"].diff()
     wide["pe_ltp_chg"] = wide.groupby("strike")["pe_ltp"].diff()
     return wide
-
 
 def infer_atm_strike(wide_latest: pd.DataFrame) -> float:
     spot = float(wide_latest["spot"].median()) if "spot" in wide_latest.columns and wide_latest["spot"].notna().any() else np.nan
@@ -232,8 +228,14 @@ trending_k = st.sidebar.slider("Trending OI window (ATM ± strikes)", 5, 7, 5)
 oi_alert_pct = st.sidebar.slider("Exceptional OI% threshold", 5, 500, 50)
 st.sidebar.markdown("---")
 # client-side auto refresh
-if st.sidebar.toggle("Auto refresh every n seconds", value=True):
-    st_autorefresh(interval=int(refresh_secs * 1000), key="auto_refresh")
+# (Use st.toggle if your Streamlit version doesn't support st.sidebar.toggle)
+if getattr(st.sidebar, "toggle", None):
+    if st.sidebar.toggle("Auto refresh every n seconds", value=True):
+        st_autorefresh(interval=int(refresh_secs * 1000), key="auto_refresh")
+else:
+    if st.checkbox("Auto refresh every n seconds", value=True):
+        st_autorefresh(interval=int(refresh_secs * 1000), key="auto_refresh")
+
 st.sidebar.button("🔄 Refresh now", on_click=lambda: st.cache_data.clear())
 
 # ------------------------
@@ -334,10 +336,9 @@ except Exception:
 
 c1, c2, c3, c4 = st.columns([1.4, 1, 1, 1])
 with c1:
-    st.markdown(f"**Spot (approx)**  
-:large_blue_circle: **{spot:.2f}**")
-    st.markdown(f"**Snapshot**  
-{snapshot_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    # Two-line markdown; close the string properly to avoid unterminated f-string errors.
+    st.markdown(f"**Spot (approx)**  \n:large_blue_circle: **{spot:.2f}**")
+    st.markdown(f"**Snapshot**  \n{snapshot_time.strftime('%Y-%m-%d %H:%M:%S')}")
 with c2:
     st.metric("Buyer % (CE proxy)", f"{buyer_pct:.1f}%")
 with c3:
@@ -346,8 +347,8 @@ with c4:
     st.metric("PCR", f"{pcr_val:.2f}" if np.isfinite(pcr_val) else "—")
     st.markdown(
         f"""
-        <div style=\"margin-top:6px;padding:10px;border-radius:10px;background:{sentiment_color};color:white;text-align:center\">
-        <strong>Market Sentiment</strong><br><span style=\"font-size:18px\">{sentiment_label}</span>
+        <div style="margin-top:6px;padding:10px;border-radius:10px;background:{sentiment_color};color:white;text-align:center">
+        <strong>Market Sentiment</strong><br><span style="font-size:18px">{sentiment_label}</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -430,13 +431,33 @@ if sel_str:
 
     a1, a2, a3, a4 = st.columns(4)
     with a1:
-        st.markdown(f"<div style='padding:10px;border-radius:8px;background:#e8f5e9'><strong>CE OI</strong><br><span style='font-size:20px'>{int(ce_oi):,}</span><br><small>Δ {int(ce_oi_chg):+,}</small></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='padding:10px;border-radius:8px;background:#e8f5e9'>"
+            f"<strong>CE OI</strong><br><span style='font-size:20px'>{int(ce_oi):,}</span>"
+            f"<br><small>Δ {int(ce_oi_chg):+,}</small></div>",
+            unsafe_allow_html=True,
+        )
     with a2:
-        st.markdown(f"<div style='padding:10px;border-radius:8px;background:#ffebee'><strong>PE OI</strong><br><span style='font-size:20px'>{int(pe_oi):,}</span><br><small>Δ {int(pe_oi_chg):+,}</small></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='padding:10px;border-radius:8px;background:#ffebee'>"
+            f"<strong>PE OI</strong><br><span style='font-size:20px'>{int(pe_oi):,}</span>"
+            f"<br><small>Δ {int(pe_oi_chg):+,}</small></div>",
+            unsafe_allow_html=True,
+        )
     with a3:
-        st.markdown(f"<div style='padding:10px;border-radius:8px;background:#e3f2fd'><strong>CE LTP</strong><br><span style='font-size:20px'>{ce_ltp:.2f}</span><br><small>Δ {ce_ltp_chg:+.2f} ({ce_ltp_chg_pct:+.1f}%)</small></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='padding:10px;border-radius:8px;background:#e3f2fd'>"
+            f"<strong>CE LTP</strong><br><span style='font-size:20px'>{ce_ltp:.2f}</span>"
+            f"<br><small>Δ {ce_ltp_chg:+.2f} ({ce_ltp_chg_pct:+.1f}%)</small></div>",
+            unsafe_allow_html=True,
+        )
     with a4:
-        st.markdown(f"<div style='padding:10px;border-radius:8px;background:#fff8e1'><strong>PE LTP</strong><br><span style='font-size:20px'>{pe_ltp:.2f}</span><br><small>Δ {pe_ltp_chg:+.2f} ({pe_ltp_chg_pct:+.1f}%)</small></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='padding:10px;border-radius:8px;background:#fff8e1'>"
+            f"<strong>PE LTP</strong><br><span style='font-size:20px'>{pe_ltp:.2f}</span>"
+            f"<br><small>Δ {pe_ltp_chg:+.2f} ({pe_ltp_chg_pct:+.1f}%)</small></div>",
+            unsafe_allow_html=True,
+        )
 
 # ------------------------
 # MASTER/INTRADAY HISTORY VIEWS
