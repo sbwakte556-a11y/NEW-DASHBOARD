@@ -196,7 +196,7 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
 
     wide = pd.concat([
         piv_oi.rename(columns={"CE": "ce_oi", "PE": "pe_oi"}),
-        piv_ltp.rename(columns={"CE": "ce_ltp", "PE": "pe_ltp"]),
+        piv_ltp.rename(columns={"CE": "ce_ltp", "PE": "pe_ltp"}),
         piv_iv.rename(columns={"CE": "ce_iv", "PE": "pe_iv"}),
         piv_vflow.rename(columns={"CE": "ce_vflow", "PE": "pe_vflow"}),
         piv_vtot.rename(columns={"CE": "ce_vtot", "PE": "pe_vtot"}),
@@ -773,3 +773,4 @@ with st.expander("🔎 Raw Latest Snapshot"):
 
 st.markdown("---")
 st.caption("This dashboard fetches NSE option-chain live and refreshes automatically. Intraday trends are from in-session history only. Use with caution.")
+
