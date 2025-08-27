@@ -1,6 +1,8 @@
+# app.py
 from __future__ import annotations
+import math
 import time
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import requests
 import pandas as pd
 import numpy as np
@@ -17,24 +19,33 @@ try:
 except Exception:
     HAS_AGGRID = False
 
-# ------------------------
-# CONFIG / DEFAULTS
-# ------------------------
+# ========================
+# PAGE CONFIG
+# ========================
 st.set_page_config(layout="wide", page_title="NIFTY Options Live — Online", page_icon="📈")
 
-DEFAULT_SYMBOL = "NIFTY"
-SYMBOL = st.sidebar.selectbox("Symbol", ["NIFTY", "BANKNIFTY"], index=0)
+# ========================
+# CONSTANTS / DEFAULTS
+# ========================
 TIMEZONE = "Asia/Kolkata"
 IST = pytz.timezone(TIMEZONE)
-REFRESH_SECS_DEFAULT = 180
-STRIKE_STEP = 50
-NEAR_STRIKES_DEFAULT = 3
-MAX_HISTORY_POINTS = 480
-ATM_TOP_STRIKE_SPAN = 5   # Top strikes limited to ATM ± 5
 
-# ------------------------
-# HTTP / NSE HELPERS
-# ------------------------
+DEFAULT_SYMBOL = "NIFTY"
+STRIKE_STEP = 50
+REFRESH_SECS_DEFAULT = 180
+NEAR_STRIKES_DEFAULT = 3           # for alerting (ATM ±3)
+PANEL_STRIKES_DEFAULT = 7          # for LTP vs VWAP panel (ATM ±7)
+MAX_HISTORY_POINTS = 2000
+ATM_TOP_STRIKE_SPAN = 5            # top table window
+DEFAULT_RISK_FREE = 0.0675         # 6.75% annual
+DEFAULT_DIV_YIELD = 0.0
+
+BULLISH_BUILDS = {"Long Buildup", "Short Covering"}
+BEARISH_BUILDS = {"Short Buildup", "Long Unwinding"}
+
+# ========================
+# UTILS
+# ========================
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -51,24 +62,21 @@ def make_session() -> requests.Session:
     return s
 
 @st.cache_data(show_spinner=False, ttl=10)
-def fetch_option_chain(symbol: str = SYMBOL, tries: int = 5, backoff: float = 1.5) -> pd.DataFrame:
-    """Fetch NSE option-chain for an index symbol and return tidy long DataFrame.
-    Columns: symbol, strike, option_type, ltp, oi, volume, iv, ts, spot, expiry
-    """
+def fetch_option_chain(symbol: str) -> pd.DataFrame:
+    """Return tidy long DataFrame with: symbol, strike, option_type, ltp, oi, volume, iv, ts, spot, expiry"""
     url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     s = make_session()
     headers = {"accept": "application/json, text/plain, */*", "referer": "https://www.nseindia.com/option-chain"}
-
     data: Dict = {}
-    for attempt in range(tries):
+    for attempt in range(5):
         try:
             r = s.get(url, headers=headers, timeout=12)
             if r.status_code == 200:
                 data = r.json()
                 break
-            time.sleep(backoff * (attempt + 1))
         except Exception:
-            time.sleep(backoff * (attempt + 1))
+            pass
+        time.sleep(1.2 * (attempt + 1))
     if not data:
         return pd.DataFrame()
 
@@ -92,19 +100,14 @@ def fetch_option_chain(symbol: str = SYMBOL, tries: int = 5, backoff: float = 1.
                 "option_type": side,
                 "ltp": float(leg.get("lastPrice") or 0.0),
                 "oi": float(leg.get("openInterest") or 0.0),
-                "volume": float(leg.get("totalTradedVolume") or 0.0),
+                "volume_total": float(leg.get("totalTradedVolume") or 0.0),  # cumulative total from NSE
                 "iv": float(leg.get("impliedVolatility") or 0.0),
-                "vwap": np.nan,  # not in this endpoint
                 "ts": ts,
                 "spot": float(spot or 0.0),
                 "expiry": str(expiry) if expiry else None,
             })
-
     return pd.DataFrame(rows)
 
-# ------------------------
-# ANALYTICS HELPERS
-# ------------------------
 def nearest_strike(price: float, step: int = STRIKE_STEP) -> int:
     return int(round(price / step) * step)
 
@@ -126,70 +129,73 @@ def enrich_with_prev(curr: pd.DataFrame, prev: Optional[pd.DataFrame]) -> pd.Dat
         return curr
     df = curr.copy()
     if prev is None or prev.empty:
-        df["prev_ltp"], df["prev_oi"] = df["ltp"], df["oi"]
+        df["prev_ltp"], df["prev_oi"], df["prev_volume_total"] = df["ltp"], df["oi"], df["volume_total"]
     else:
-        m = prev[["symbol", "strike", "option_type", "ltp", "oi"]].rename(columns={"ltp": "prev_ltp", "oi": "prev_oi"})
+        m = prev[["symbol", "strike", "option_type", "ltp", "oi", "volume_total"]].rename(
+            columns={"ltp": "prev_ltp", "oi": "prev_oi", "volume_total": "prev_volume_total"}
+        )
         df = df.merge(m, on=["symbol", "strike", "option_type"], how="left")
         df["prev_ltp"] = df["prev_ltp"].fillna(df["ltp"])
         df["prev_oi"] = df["prev_oi"].fillna(df["oi"])
+        df["prev_volume_total"] = df["prev_volume_total"].fillna(df["volume_total"])
 
+    # One-interval deltas
     df["oi_chg"] = df["oi"] - df["prev_oi"]
     df["ltp_chg"] = df["ltp"] - df["prev_ltp"]
-    df["oi_chg_pct"] = np.where(df["prev_oi"] > 0, 100 * df["oi_chg"] / df["prev_oi"], 0.0)
+    df["oi_chg_pct"] = np.where(df["prev_oi"] > 0, 100 * df["oi_chg"] / df["prev_oi"], np.where(df["oi_chg"] > 0, 100, 0))
     df["ltp_chg_pct"] = np.where(df["prev_ltp"] > 0, 100 * df["ltp_chg"] / df["prev_ltp"], 0.0)
+
+    # Volume flow for VWAP (per-interval traded volume)
+    df["vol_flow"] = (df["volume_total"] - df["prev_volume_total"]).clip(lower=0)
+
     df["buildup"] = [classify_buildup(o, p) for o, p in zip(df["oi_chg"], df["ltp_chg"])]
     return df
 
 def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
-    keep = ["strike", "option_type", "oi", "ltp", "spot", "ts"]
+    keep = ["ts", "spot", "strike", "option_type", "oi", "ltp", "iv", "vol_flow", "volume_total"]
     df = df_long[keep].copy()
     df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
-    df["oi"] = pd.to_numeric(df["oi"], errors="coerce")
-    df["ltp"] = pd.to_numeric(df["ltp"], errors="coerce")
     df = df.dropna(subset=["strike"])
+
+    agg = {
+        "oi": "sum",
+        "ltp": "mean",
+        "iv": "mean",
+        "vol_flow": "sum",
+        "volume_total": "sum",
+    }
+    piv = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values=agg, aggfunc="sum")
+    # Flatten columns
+    piv.columns = [f"{side}_{col}" for col in piv.columns.get_level_values(0) for col in [piv.columns.get_level_values(1)[0]]]
+    # The above is a bit ugly due to pivot_table; re-assemble cleanly:
+    # We'll rebuild with separate pivots for clarity
     piv_oi = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values="oi", aggfunc="sum")
     piv_ltp = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values="ltp", aggfunc="mean")
+    piv_iv = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values="iv", aggfunc="mean")
+    piv_vflow = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values="vol_flow", aggfunc="sum")
+    piv_vtot = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values="volume_total", aggfunc="sum")
+
     wide = pd.concat([
         piv_oi.rename(columns={"CE": "ce_oi", "PE": "pe_oi"}),
         piv_ltp.rename(columns={"CE": "ce_ltp", "PE": "pe_ltp"}),
+        piv_iv.rename(columns={"CE": "ce_iv", "PE": "pe_iv"}),
+        piv_vflow.rename(columns={"CE": "ce_vflow", "PE": "pe_vflow"}),
+        piv_vtot.rename(columns={"CE": "ce_vtot", "PE": "pe_vtot"}),
     ], axis=1).reset_index()
-    for c in ["ce_oi", "pe_oi", "ce_ltp", "pe_ltp"]:
+
+    for c in ["ce_oi", "pe_oi", "ce_ltp", "pe_ltp", "ce_iv", "pe_iv", "ce_vflow", "pe_vflow", "ce_vtot", "pe_vtot"]:
         if c not in wide.columns:
             wide[c] = np.nan
-    # one-interval changes
-    wide = wide.sort_values(["ts", "strike"]).reset_index(drop=True)
+
+    # One-interval changes (by strike)
+    wide = wide.sort_values(["strike", "ts"]).reset_index(drop=True)
     wide["ce_oi_chg"] = wide.groupby("strike")["ce_oi"].diff()
     wide["pe_oi_chg"] = wide.groupby("strike")["pe_oi"].diff()
     wide["ce_ltp_chg"] = wide.groupby("strike")["ce_ltp"].diff()
     wide["pe_ltp_chg"] = wide.groupby("strike")["pe_ltp"].diff()
     return wide
 
-def infer_atm_strike(wide_latest: pd.DataFrame) -> float:
-    spot = float(wide_latest["spot"].median()) if "spot" in wide_latest.columns and wide_latest["spot"].notna().any() else np.nan
-    if np.isfinite(spot):
-        diffs = (wide_latest["strike"] - spot).abs()
-        return float(wide_latest.loc[diffs.idxmin(), "strike"])
-    ssum = (wide_latest["ce_ltp"].fillna(0) + wide_latest["pe_ltp"].fillna(0))
-    return float(wide_latest.loc[ssum.idxmin(), "strike"]) if not wide_latest.empty else np.nan
-
-# ---------- Expiry helper ----------
-def _pick_default_expiry(expiries: List[str]) -> Optional[str]:
-    """Choose the nearest upcoming expiry (today or later)."""
-    if not expiries:
-        return None
-    ex = pd.to_datetime(pd.Series(expiries), errors="coerce")
-    today = pd.Timestamp.now(tz=IST).normalize()
-    try:
-        future_mask = ex.dt.date >= today.date()
-        if future_mask.any():
-            return str(pd.Series(expiries)[future_mask].iloc[0])
-    except Exception:
-        pass
-    order = ex.sort_values(kind="mergesort").index
-    return str(pd.Series(expiries).iloc[order[0]])
-
 def split_weekly_monthly(expiries: List[str]) -> Dict[str, List[str]]:
-    """Last expiry date of a month = Monthly, others = Weekly."""
     if not expiries:
         return {"weekly": [], "monthly": [], "all": []}
     ex = pd.to_datetime(pd.Series(expiries), errors="coerce")
@@ -201,14 +207,20 @@ def split_weekly_monthly(expiries: List[str]) -> Dict[str, List[str]]:
     weekly = df.loc[~df["is_monthly"], "raw"].astype(str).tolist()
     return {"weekly": weekly, "monthly": monthly, "all": list(pd.Series(expiries).astype(str).unique())}
 
-# ---------- Styling helpers (Green/Red for bullish/bearish) ----------
-BULLISH_BUILDS = {"Long Buildup", "Short Covering"}
-BEARISH_BUILDS = {"Short Buildup", "Long Unwinding"}
+def pick_default_expiry(expiries: List[str]) -> Optional[str]:
+    if not expiries:
+        return None
+    ex = pd.to_datetime(pd.Series(expiries), errors="coerce")
+    today = pd.Timestamp.now(tz=IST).normalize()
+    mask = ex.dt.date >= today.date()
+    if mask.any():
+        return str(pd.Series(expiries)[mask].iloc[0])
+    order = ex.sort_values(kind="mergesort").index
+    return str(pd.Series(expiries).iloc[order[0]])
 
 def style_oi_change(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     cols_to_color = [c for c in ["oi_chg", "oi_chg_pct", "CE OI Δ", "PE OI Δ", "CE LTP Δ", "PE LTP Δ"] if c in df.columns]
     def _row_style(row):
-        # pick any available buildup marker on the row
         b = row.get("buildup", row.get("CE Buildup", row.get("PE Buildup", "Neutral")))
         color = ""
         if b in BULLISH_BUILDS:
@@ -218,45 +230,103 @@ def style_oi_change(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         return [color if c in cols_to_color else "" for c in df.columns]
     return df.style.apply(_row_style, axis=1)
 
-# ------------------------
-# SIDEBAR / SETTINGS
-# ------------------------
+# ========================
+# BLACK–SCHOLES (theoretical premium)
+# ========================
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def bs_theoretical(spot: float, strike: float, t_years: float, r: float, q: float, iv_pct: float, call: bool) -> float:
+    """European BS for index options. iv_pct is IV in percent (e.g. 15.0)."""
+    if t_years <= 0 or iv_pct <= 0 or spot <= 0 or strike <= 0:
+        return 0.0
+    sigma = iv_pct / 100.0
+    try:
+        d1 = (math.log(spot / strike) + (r - q + 0.5 * sigma * sigma) * t_years) / (sigma * math.sqrt(t_years))
+        d2 = d1 - sigma * math.sqrt(t_years)
+        if call:
+            return spot * math.exp(-q * t_years) * _norm_cdf(d1) - strike * math.exp(-r * t_years) * _norm_cdf(d2)
+        else:
+            return strike * math.exp(-r * t_years) * _norm_cdf(-d2) - spot * math.exp(-q * t_years) * _norm_cdf(-d1)
+    except Exception:
+        return 0.0
+
+def years_to_expiry(expiry_str: str, now_ts: pd.Timestamp) -> float:
+    # Consider expiry at 15:30 IST on the date
+    try:
+        d = pd.to_datetime(expiry_str)
+        expiry_dt = pd.Timestamp(year=d.year, month=d.month, day=d.day, hour=15, minute=30, tz=IST)
+        # if already past, zero
+        delta = max((expiry_dt - now_ts).total_seconds(), 0.0)
+        return delta / (365.0 * 24 * 3600.0)
+    except Exception:
+        return 0.0
+
+# ========================
+# TELEGRAM
+# ========================
+def send_telegram(token: str, chat_id: str, text: str) -> Tuple[bool, str]:
+    if not token or not chat_id:
+        return False, "Token/Chat ID not set"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+        if r.status_code == 200:
+            return True, "ok"
+        return False, f"HTTP {r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return False, str(e)
+
+# ========================
+# SIDEBAR
+# ========================
 st.sidebar.title("Settings")
+SYMBOL = st.sidebar.selectbox("Symbol", ["NIFTY", "BANKNIFTY"], index=0)
 refresh_secs = st.sidebar.number_input("Auto-refresh (seconds)", min_value=30, max_value=900, value=REFRESH_SECS_DEFAULT, step=30)
-near_strikes = st.sidebar.slider("Strikes near ATM (±)", 1, 6, NEAR_STRIKES_DEFAULT)
-trending_k = st.sidebar.slider("Trending OI window (ATM ± strikes)", 5, 7, 5)
-oi_alert_pct = st.sidebar.slider("Exceptional OI% threshold", 5, 500, 50)
+near_strikes = st.sidebar.slider("Strikes near ATM for Alerts (±)", 1, 5, NEAR_STRIKES_DEFAULT)
+panel_strikes = st.sidebar.slider("Strikes for CE/PE Panel (±)", 3, 10, PANEL_STRIKES_DEFAULT)
+oi_alert_pct = st.sidebar.slider("Exceptional OI% threshold (3-min window)", 5, 500, 80)
+risk_free = st.sidebar.number_input("Risk-free rate (annual)", min_value=0.0, max_value=0.2, value=DEFAULT_RISK_FREE, step=0.0025, format="%.4f")
+div_yield = st.sidebar.number_input("Dividend yield (annual)", min_value=0.0, max_value=0.1, value=DEFAULT_DIV_YIELD, step=0.0025, format="%.4f")
+
 st.sidebar.markdown("---")
-# client-side auto refresh
-# (Use st.toggle if your Streamlit version doesn't support st.sidebar.toggle)
-if getattr(st.sidebar, "toggle", None):
-    if st.sidebar.toggle("Auto refresh every n seconds", value=True):
-        st_autorefresh(interval=int(refresh_secs * 1000), key="auto_refresh")
-else:
-    if st.checkbox("Auto refresh every n seconds", value=True):
-        st_autorefresh(interval=int(refresh_secs * 1000), key="auto_refresh")
+enable_auto = st.sidebar.toggle("Auto refresh on", value=True)
+if enable_auto:
+    st_autorefresh(interval=int(refresh_secs * 1000), key="auto_refresh")
+
+st.sidebar.markdown("### Telegram Alerts")
+tg_enable = st.sidebar.toggle("Enable Telegram Alerts (every ~3 minutes)", value=False)
+tg_token = st.sidebar.text_input("Bot Token", type="password")
+tg_chat = st.sidebar.text_input("Chat ID")
 
 st.sidebar.button("🔄 Refresh now", on_click=lambda: st.cache_data.clear())
 
-# ------------------------
-# FETCH & ENRICH
-# ------------------------
-st.title(f"📈 {SYMBOL} Options Live — Online Dashboard")
-_now_ist = dt.datetime.now(IST).time()
-if not (dt.time(9, 14) <= _now_ist <= dt.time(15, 31)):
-    st.info("Market appears closed. Data may be stale or unchanged.")
-status = st.empty()
-
+# ========================
+# SESSION STATE
+# ========================
 if "prev_snapshot" not in st.session_state:
     st.session_state.prev_snapshot = None
 if "history_wide" not in st.session_state:
     st.session_state.history_wide = pd.DataFrame()
+if "last_alert_ts" not in st.session_state:
+    st.session_state.last_alert_ts = None
+if "last_spike_ids" not in st.session_state:
+    st.session_state.last_spike_ids = set()   # to avoid duplicate spike pings
 
+# ========================
+# FETCH
+# ========================
+st.title(f"📈 {SYMBOL} Options Live — Online Dashboard")
+_now_ist = dt.datetime.now(IST).time()
+if not (dt.time(9, 14) <= _now_ist <= dt.time(15, 31)):
+    st.info("Market appears closed. Data may be stale or unchanged.")
+
+status = st.empty()
 try:
     status.info("Fetching option-chain from NSE…")
     curr = fetch_option_chain(SYMBOL)
 
-    # ---- Expiry selector (with Weekly/Monthly toggle) ----
+    # Expiry selection with Weekly/Monthly
     if ("expiry" in curr.columns) and (not curr.empty):
         _exps_all = (
             pd.Series(curr["expiry"].dropna().astype(str).unique())
@@ -273,27 +343,28 @@ try:
             _exps = buckets["all"]
         if not _exps:
             _exps = _exps_all
-        _default = _pick_default_expiry(_exps) or (_exps[0] if _exps else None)
-        _default_idx = _exps.index(_default) if _default in _exps else 0
+        _default = pick_default_expiry(_exps) or (_exps[0] if _exps else None)
+        _default_idx = _exps.index(_default) if (_default and _default in _exps) else 0
         chosen_expiry = st.sidebar.selectbox("Expiry", _exps, index=_default_idx)
         curr = curr[curr["expiry"].astype(str) == str(chosen_expiry)].copy()
     else:
-        st.sidebar.caption("Expiry filter unavailable (no 'expiry' column).")
+        st.sidebar.caption("Expiry filter unavailable (no 'expiry').")
 
     if curr.empty:
-        status.error("Failed to fetch data (empty). Try again shortly.")
+        status.error("Failed to fetch data (empty). Try again.")
         st.stop()
     status.success("Fetched live option chain.")
 except Exception as e:
     status.error(f"Fetch failed: {e}")
     st.stop()
 
-# enrich vs previous snapshot
+# ========================
+# ENRICH & HISTORY
+# ========================
 prev = st.session_state.prev_snapshot
 df_en = enrich_with_prev(curr, prev)
-st.session_state.prev_snapshot = curr[["symbol", "strike", "option_type", "ltp", "oi"]].copy()
+st.session_state.prev_snapshot = curr[["symbol", "strike", "option_type", "ltp", "oi", "volume_total"]].copy()
 
-# accumulate history in wide format
 wide_latest = make_wide(df_en)
 if not wide_latest.empty:
     hist = st.session_state.history_wide
@@ -301,24 +372,23 @@ if not wide_latest.empty:
     if len(st.session_state.history_wide) > MAX_HISTORY_POINTS:
         st.session_state.history_wide = st.session_state.history_wide.tail(MAX_HISTORY_POINTS).reset_index(drop=True)
 
-# ------------------------
-# HEADER METRICS & SENTIMENT BASICS
-# ------------------------
+# ========================
+# HEADER METRICS & SENTIMENT
+# ========================
 spot = float(df_en["spot"].dropna().iloc[0]) if "spot" in df_en.columns and not df_en["spot"].dropna().empty else 0.0
 snapshot_time = pd.to_datetime(df_en["ts"].iloc[0]) if "ts" in df_en.columns else dt.datetime.now(IST)
 
 ce = df_en[df_en.option_type == "CE"].copy()
 pe = df_en[df_en.option_type == "PE"].copy()
-ce_strength = float((ce["volume"].fillna(0) * ce["ltp_chg"].abs().fillna(0)).sum())
-pe_strength = float((pe["volume"].fillna(0) * pe["ltp_chg"].abs().fillna(0)).sum())
-
-total_strength = (ce_strength + pe_strength) or 1
-buyer_pct = 100 * ce_strength / total_strength
-seller_pct = 100 * pe_strength / total_strength
+# A balanced sentiment proxy: volume*|price change| on each side
+ce_strength = float((ce["vol_flow"].fillna(0) * ce["ltp"].abs().fillna(0)).sum())
+pe_strength = float((pe["vol_flow"].fillna(0) * pe["ltp"].abs().fillna(0)).sum())
+total_strength = (ce_strength + pe_strength) or 1.0
+buyer_pct = 100.0 * ce_strength / total_strength
+seller_pct = 100.0 * pe_strength / total_strength
 
 up_count = ((df_en["buildup"] == "Long Buildup") | (df_en["buildup"] == "Short Covering")).sum()
 down_count = ((df_en["buildup"] == "Short Buildup") | (df_en["buildup"] == "Long Unwinding")).sum()
-
 sent_score = 0.6 * (buyer_pct - seller_pct) + 0.4 * (up_count - down_count)
 if sent_score > 15:
     sentiment_label, sentiment_color = "Bullish", "#1b5e20"
@@ -328,17 +398,16 @@ else:
     sentiment_label, sentiment_color = "Neutral", "#263238"
 
 try:
-    ce_oi_total = float(df_en[df_en.option_type == "CE"]["oi"].sum())
-    pe_oi_total = float(df_en[df_en.option_type == "PE"]["oi"].sum())
+    ce_oi_total = float(ce["oi"].sum())
+    pe_oi_total = float(pe["oi"].sum())
     pcr_val = pe_oi_total / ce_oi_total if ce_oi_total > 0 else np.nan
 except Exception:
     pcr_val = np.nan
 
-c1, c2, c3, c4 = st.columns([1.4, 1, 1, 1])
+c1, c2, c3, c4 = st.columns([1.6, 1, 1, 1.2])
 with c1:
-    # Two-line markdown; close the string properly to avoid unterminated f-string errors.
-    st.markdown(f"**Spot (approx)**  \n:large_blue_circle: **{spot:.2f}**")
-    st.markdown(f"**Snapshot**  \n{snapshot_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    st.markdown("**Spot (approx)**  \n:large_blue_circle: **{:.2f}**".format(spot))
+    st.markdown("**Snapshot**  \n{}".format(snapshot_time.strftime('%Y-%m-%d %H:%M:%S')))
 with c2:
     st.metric("Buyer % (CE proxy)", f"{buyer_pct:.1f}%")
 with c3:
@@ -346,160 +415,128 @@ with c3:
 with c4:
     st.metric("PCR", f"{pcr_val:.2f}" if np.isfinite(pcr_val) else "—")
     st.markdown(
-        f"""
-        <div style="margin-top:6px;padding:10px;border-radius:10px;background:{sentiment_color};color:white;text-align:center">
-        <strong>Market Sentiment</strong><br><span style="font-size:18px">{sentiment_label}</span>
+        """
+        <div style="margin-top:6px;padding:10px;border-radius:10px;background:%s;color:white;text-align:center">
+        <strong>Market Sentiment</strong><br><span style="font-size:18px">%s</span>
         </div>
-        """,
+        """ % (sentiment_color, sentiment_label),
         unsafe_allow_html=True,
     )
 
 st.markdown("---")
 
-# ------------------------
-# NEAR-ATM VIEW (colored by buildup)
-# ------------------------
-def select_near_atm(df: pd.DataFrame, spot: float, n: int = NEAR_STRIKES_DEFAULT) -> pd.DataFrame:
+# ========================
+# NEAR-ATM TABLE (colored by buildup)
+# ========================
+def select_near_atm(df: pd.DataFrame, spot_price: float, n: int) -> pd.DataFrame:
     if df.empty:
         return df
-    atm_ = nearest_strike(spot)
+    atm_ = nearest_strike(spot_price)
     lo, hi = atm_ - n * STRIKE_STEP, atm_ + n * STRIKE_STEP
     return df[(df["strike"] >= lo) & (df["strike"] <= hi)].copy()
 
-near = select_near_atm(df_en, spot, n=near_strikes)
+near_view = select_near_atm(df_en, spot, n=near_strikes)
 st.subheader(f"Strikes around ATM (±{near_strikes * STRIKE_STEP} points)")
-if near.empty:
+if near_view.empty:
     st.warning("No near-ATM data available.")
 else:
-    show_cols = ["strike", "option_type", "ltp", "iv", "oi", "oi_chg_pct", "ltp_chg_pct", "buildup"]
-    _near_tbl = near.sort_values(["strike", "option_type"])[show_cols]
+    show_cols = ["strike", "option_type", "ltp", "iv", "oi", "oi_chg", "oi_chg_pct", "ltp_chg", "ltp_chg_pct", "buildup"]
+    tbl = near_view.sort_values(["strike", "option_type"])[show_cols]
     try:
-        st.dataframe(style_oi_change(_near_tbl), use_container_width=True)
+        st.dataframe(style_oi_change(tbl), use_container_width=True)
     except Exception:
-        st.dataframe(_near_tbl, use_container_width=True)
+        st.dataframe(tbl, use_container_width=True)
 
-# ------------------------
-# TRENDING OI — PICK ONE STRIKE (one-interval view)
-# ------------------------
-st.markdown("---")
-st.subheader("🔎 Trending OI — pick a strike (interval vs previous)")
-
-available_strikes = sorted(df_en["strike"].unique()) if not df_en.empty else []
-sel_str_index = len(available_strikes) // 2 if available_strikes else 0
-sel_str = st.selectbox("Select strike", options=available_strikes, index=sel_str_index)
-
-if sel_str:
-    s = df_en[(df_en.strike == sel_str)]
-    ce_row = s[s.option_type == "CE"].squeeze() if not s[s.option_type == "CE"].empty else None
-    pe_row = s[s.option_type == "PE"].squeeze() if not s[s.option_type == "PE"].empty else None
-
-    def safe_val(row, col, default=0.0):
-        try:
-            if row is None:
-                return float(default)
-            if isinstance(row, dict):
-                v = row.get(col, default)
-            elif hasattr(row, 'index') and not hasattr(row, 'columns'):
-                v = row[col] if col in row.index else default
-            elif hasattr(row, 'columns'):
-                if col in row.columns and len(row) > 0:
-                    v = row.iloc[0][col]
-                else:
-                    v = default
-            else:
-                v = getattr(row, col, default)
-            if hasattr(v, '__array__') or str(type(v)).endswith("Series'>"):
-                try:
-                    v = next((x for x in np.ravel(v) if pd.notna(x)), default)
-                except Exception:
-                    v = default
-            return float(v) if (v is not None and pd.notna(v)) else float(default)
-        except Exception:
-            return float(default)
-
-    ce_oi = safe_val(ce_row, "oi");        pe_oi = safe_val(pe_row, "oi")
-    ce_prev_oi = safe_val(ce_row, "prev_oi"); pe_prev_oi = safe_val(pe_row, "prev_oi")
-    ce_oi_chg = ce_oi - ce_prev_oi;          pe_oi_chg = pe_oi - pe_prev_oi
-    ce_oi_chg_pct = (100 * ce_oi_chg / ce_prev_oi) if ce_prev_oi > 0 else (100 if ce_oi_chg > 0 else 0)
-    pe_oi_chg_pct = (100 * pe_oi_chg / pe_prev_oi) if pe_prev_oi > 0 else (100 if pe_oi_chg > 0 else 0)
-
-    ce_ltp = safe_val(ce_row, "ltp");      pe_ltp = safe_val(pe_row, "ltp")
-    ce_prev_ltp = safe_val(ce_row, "prev_ltp"); pe_prev_ltp = safe_val(pe_row, "prev_ltp")
-    ce_ltp_chg = ce_ltp - ce_prev_ltp;       pe_ltp_chg = pe_ltp - pe_prev_ltp
-    ce_ltp_chg_pct = (100 * ce_ltp_chg / ce_prev_ltp) if ce_prev_ltp > 0 else 0
-    pe_ltp_chg_pct = (100 * pe_ltp_chg / pe_prev_ltp) if pe_prev_ltp > 0 else 0
-
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        st.markdown(
-            f"<div style='padding:10px;border-radius:8px;background:#e8f5e9'>"
-            f"<strong>CE OI</strong><br><span style='font-size:20px'>{int(ce_oi):,}</span>"
-            f"<br><small>Δ {int(ce_oi_chg):+,}</small></div>",
-            unsafe_allow_html=True,
-        )
-    with a2:
-        st.markdown(
-            f"<div style='padding:10px;border-radius:8px;background:#ffebee'>"
-            f"<strong>PE OI</strong><br><span style='font-size:20px'>{int(pe_oi):,}</span>"
-            f"<br><small>Δ {int(pe_oi_chg):+,}</small></div>",
-            unsafe_allow_html=True,
-        )
-    with a3:
-        st.markdown(
-            f"<div style='padding:10px;border-radius:8px;background:#e3f2fd'>"
-            f"<strong>CE LTP</strong><br><span style='font-size:20px'>{ce_ltp:.2f}</span>"
-            f"<br><small>Δ {ce_ltp_chg:+.2f} ({ce_ltp_chg_pct:+.1f}%)</small></div>",
-            unsafe_allow_html=True,
-        )
-    with a4:
-        st.markdown(
-            f"<div style='padding:10px;border-radius:8px;background:#fff8e1'>"
-            f"<strong>PE LTP</strong><br><span style='font-size:20px'>{pe_ltp:.2f}</span>"
-            f"<br><small>Δ {pe_ltp_chg:+.2f} ({pe_ltp_chg_pct:+.1f}%)</small></div>",
-            unsafe_allow_html=True,
-        )
-
-# ------------------------
-# MASTER/INTRADAY HISTORY VIEWS
-# ------------------------
-if not st.session_state.history_wide.empty:
-    hist = st.session_state.history_wide.copy()
-
+# ========================
+# HISTORY SNAPSHOT
+# ========================
+hist = st.session_state.history_wide.copy()
+if not hist.empty:
     latest_ts = hist["ts"].max()
     latest_df = hist[hist["ts"] == latest_ts].copy()
 
-    # === Header block 2: ATM, spot, snapshots ===
+    # ATM metric block
+    def infer_atm_strike(wide_latest: pd.DataFrame) -> float:
+        spot_m = float(wide_latest["spot"].median()) if "spot" in wide_latest.columns and wide_latest["spot"].notna().any() else np.nan
+        if np.isfinite(spot_m):
+            diffs = (wide_latest["strike"] - spot_m).abs()
+            return float(wide_latest.loc[diffs.idxmin(), "strike"])
+        ssum = (wide_latest["ce_ltp"].fillna(0) + wide_latest["pe_ltp"].fillna(0))
+        return float(wide_latest.loc[ssum.idxmin(), "strike"]) if not wide_latest.empty else np.nan
+
     atm = infer_atm_strike(latest_df)
     spot_latest = float(latest_df["spot"].median()) if latest_df["spot"].notna().any() else np.nan
-
     c1, c2, c3 = st.columns(3)
     c1.metric("ATM", f"{atm:.0f}" if np.isfinite(atm) else "—")
     c2.metric("Spot (median)", f"{spot_latest:,.2f}" if np.isfinite(spot_latest) else "—")
     c3.metric("Snapshots stored", str(hist["ts"].nunique()))
 
-    # Restrict Top Strikes to ATM ± ATM_TOP_STRIKE_SPAN
+    # ------------------------
+    # 3-MINUTE WINDOW LOGIC
+    # ------------------------
+    def pick_3min_ago_ts(h: pd.DataFrame, ref_ts: pd.Timestamp) -> Optional[pd.Timestamp]:
+        hts = sorted(h["ts"].unique())
+        if not hts:
+            return None
+        # find the timestamp closest to ref_ts - 3 minutes (within 1–5 min tolerance)
+        target = pd.Timestamp(ref_ts) - pd.Timedelta(minutes=3)
+        candidates = [t for t in hts if (ref_ts - pd.Timestamp(t)) >= pd.Timedelta(minutes=1)]
+        if not candidates:
+            return None
+        best = min(candidates, key=lambda t: abs((pd.Timestamp(t) - target).total_seconds()))
+        # sanity: don't compare if farther than 5 minutes
+        if abs((pd.Timestamp(best) - target).total_seconds()) > 5 * 60:
+            return None
+        return pd.Timestamp(best)
+
+    ts_3m = pick_3min_ago_ts(hist, latest_ts)
+    three_min_df = pd.DataFrame()
+    if ts_3m is not None:
+        # Create a 3-min delta view by merging strikes at latest_ts vs ts_3m
+        last = hist[hist["ts"] == latest_ts].copy()
+        old = hist[hist["ts"] == ts_3m].copy()
+        mcols = ["strike", "ce_oi", "pe_oi", "ce_ltp", "pe_ltp", "ce_vtot", "pe_vtot"]
+        last = last[["strike"] + mcols[1:]]
+        old = old[["strike"] + mcols[1:]]
+        three_min_df = last.merge(old, on="strike", suffixes=("", "_old"))
+        for side in ("ce", "pe"):
+            three_min_df[f"{side}_oi_3m"] = three_min_df[f"{side}_oi"] - three_min_df[f"{side}_oi_old"]
+            three_min_df[f"{side}_ltp_3m"] = three_min_df[f"{side}_ltp"] - three_min_df[f"{side}_ltp_old"]
+            three_min_df[f"{side}_oi_3m_pct"] = np.where(
+                three_min_df[f"{side}_oi_old"] > 0,
+                100 * three_min_df[f"{side}_oi_3m"] / three_min_df[f"{side}_oi_old"],
+                np.where(three_min_df[f"{side}_oi_3m"] > 0, 100, 0)
+            )
+
+        # Spike detection
+        three_min_df["spike_flag"] = (three_min_df["ce_oi_3m_pct"].abs() >= oi_alert_pct) | (three_min_df["pe_oi_3m_pct"].abs() >= oi_alert_pct)
+
+    # ------------------------
+    # TOP STRIKES (ATM window)
+    # ------------------------
     if np.isfinite(atm):
         allowed = [atm + i * STRIKE_STEP for i in range(-ATM_TOP_STRIKE_SPAN, ATM_TOP_STRIKE_SPAN + 1)]
         latest_df_win = latest_df[latest_df["strike"].isin(allowed)].copy()
     else:
         latest_df_win = latest_df.copy()
 
-    # === Top Strikes (ATM window) ===
     st.subheader("🏆 Top Strikes — OI & Price (ATM window)")
     top_n = st.slider("Top N", 5, 15, 10)
     t1, t2 = st.columns(2)
     with t1:
         st.write(f"Top CE OI (ATM ± {ATM_TOP_STRIKE_SPAN})")
-        st.dataframe(latest_df_win.nlargest(top_n, "ce_oi")[ ["strike", "ce_oi", "ce_oi_chg"] ])
+        st.dataframe(latest_df_win.nlargest(top_n, "ce_oi")[["strike", "ce_oi", "ce_oi_chg"]])
         st.write(f"Top CE Price (ATM ± {ATM_TOP_STRIKE_SPAN})")
-        st.dataframe(latest_df_win.nlargest(top_n, "ce_ltp")[ ["strike", "ce_ltp", "ce_ltp_chg"] ])
+        st.dataframe(latest_df_win.nlargest(top_n, "ce_ltp")[["strike", "ce_ltp", "ce_ltp_chg"]])
     with t2:
         st.write(f"Top PE OI (ATM ± {ATM_TOP_STRIKE_SPAN})")
-        st.dataframe(latest_df_win.nlargest(top_n, "pe_oi")[ ["strike", "pe_oi", "pe_oi_chg"] ])
+        st.dataframe(latest_df_win.nlargest(top_n, "pe_oi")[["strike", "pe_oi", "pe_oi_chg"]])
         st.write(f"Top PE Price (ATM ± {ATM_TOP_STRIKE_SPAN})")
-        st.dataframe(latest_df_win.nlargest(top_n, "pe_ltp")[ ["strike", "pe_ltp", "pe_ltp_chg"] ])
+        st.dataframe(latest_df_win.nlargest(top_n, "pe_ltp")[["strike", "pe_ltp", "pe_ltp_chg"]])
 
-    # === Buildup (ATM ±10, PE ◀︎ | ▶︎ CE) ===
+    # ------------------------
+    # BUILDUP TABLE ATM ±10
+    # ------------------------
     st.subheader("🧮 Buildup (ATM ±10) — PE ◀︎ | ▶︎ CE")
     band10 = [atm + i * STRIKE_STEP for i in range(-10, 11)] if np.isfinite(atm) else []
     bt = latest_df[latest_df["strike"].isin(band10)].copy() if band10 else pd.DataFrame()
@@ -546,32 +583,79 @@ if not st.session_state.history_wide.empty:
     else:
         st.info("No strikes in ATM ±10 window yet.")
 
-    # === OI Distribution (Green=PE, Red=CE) ===
+    # ------------------------
+    # OI DISTRIBUTION
+    # ------------------------
     st.subheader("📊 OI Distribution (Green=PE writers, Red=CE writers)")
     fig_dist = go.Figure()
-    fig_dist.add_trace(go.Bar(x=latest_df["strike"], y=latest_df["ce_oi"], name="CE OI", marker_color="#e53935", text=latest_df["ce_oi"], textposition="auto"))
-    fig_dist.add_trace(go.Bar(x=latest_df["strike"], y=latest_df["pe_oi"], name="PE OI", marker_color="#43a047", text=latest_df["pe_oi"], textposition="auto"))
+    fig_dist.add_trace(go.Bar(x=latest_df["strike"], y=latest_df["ce_oi"], name="CE OI", marker_color="#e53935"))
+    fig_dist.add_trace(go.Bar(x=latest_df["strike"], y=latest_df["pe_oi"], name="PE OI", marker_color="#43a047"))
     fig_dist.update_layout(barmode="group", xaxis_title="Strike", yaxis_title="Open Interest")
     st.plotly_chart(fig_dist, use_container_width=True)
 
-    tot_ce = float(latest_df["ce_oi"].sum()) if "ce_oi" in latest_df else 0.0
-    tot_pe = float(latest_df["pe_oi"].sum()) if "pe_oi" in latest_df else 0.0
-    d1, d2, d3 = st.columns(3)
-    d1.metric("Total CE OI", f"{int(tot_ce):,}")
-    d2.metric("Total PE OI", f"{int(tot_pe):,}")
-    diff = tot_pe - tot_ce
-    d3.metric("PE − CE (OI)", f"{int(diff):,}", delta=f"{int(diff):,}")
+    # ========================
+    # CE/PE PANEL — ATM ±7: LTP vs VWAP + Theoretical
+    # ========================
+    st.subheader("🎛️ CE (left) & PE (right) Panel — LTP vs VWAP & Theoretical Premium (ATM ± selected)")
+    if np.isfinite(atm):
+        panel_strikes_list = [atm + i * STRIKE_STEP for i in range(-panel_strikes, panel_strikes + 1)]
+    else:
+        panel_strikes_list = sorted(latest_df["strike"].unique())[: (2 * panel_strikes + 1)]
 
-    diff_tbl = latest_df[["strike", "ce_oi", "pe_oi"]].copy()
-    diff_tbl["PE − CE"] = diff_tbl["pe_oi"].fillna(0) - diff_tbl["ce_oi"].fillna(0)
-    st.dataframe(diff_tbl.sort_values("strike"), use_container_width=True)
+    # Compute per-strike VWAP from in-session history (cumulative over time)
+    def build_vwap_series(side: str, strike_val: int) -> pd.DataFrame:
+        df = hist[(hist["strike"] == strike_val)].sort_values("ts").copy()
+        px = df[f"{side}_ltp"].fillna(method="ffill")
+        vflow = df[f"{side}_vflow"].fillna(0).clip(lower=0)
+        # cumulative VWAP
+        cum_notional = (px * vflow).cumsum()
+        cum_vol = vflow.cumsum().replace(0, np.nan)
+        vwap = (cum_notional / cum_vol).fillna(method="bfill").fillna(method="ffill")
+        return pd.DataFrame({"ts": df["ts"], "ltp": px, "vwap": vwap})
 
-    # === CE–PE Premium Crossover around ATM ===
-    st.subheader("📈 CE–PE Premium Crossover (ATM ± N Strikes)")
-    atm_cross = infer_atm_strike(latest_df)
-    strikes_window = [atm_cross + i * STRIKE_STEP for i in range(-near_strikes, near_strikes + 1)] if np.isfinite(atm_cross) else []
-    cross_df = latest_df[latest_df["strike"].isin(strikes_window)].copy() if strikes_window else pd.DataFrame()
+    # Time to expiry in years (for theoretical)
+    t_years = years_to_expiry(str(chosen_expiry) if "chosen_expiry" in locals() else "", pd.Timestamp(snapshot_time))
 
+    ce_col, pe_col = st.columns(2)
+    with ce_col:
+        st.markdown("**CE Strikes**")
+        for s in panel_strikes_list:
+            series = build_vwap_series("ce", s)
+            if series.dropna().empty:
+                continue
+            last_row = latest_df.loc[latest_df["strike"] == s]
+            ce_iv = float(last_row["ce_iv"].iloc[0]) if not last_row.empty and pd.notna(last_row["ce_iv"].iloc[0]) else 0.0
+            theo = bs_theoretical(spot, s, t_years, risk_free, div_yield, ce_iv, call=True)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=series["ts"], y=series["ltp"], name=f"{s} CE LTP"))
+            fig.add_trace(go.Scatter(x=series["ts"], y=series["vwap"], name="VWAP"))
+            fig.update_layout(title=f"{s} CE — Theoretical: {theo:.2f}", xaxis_title="Time", yaxis_title="Price")
+            st.plotly_chart(fig, use_container_width=True)
+
+    with pe_col:
+        st.markdown("**PE Strikes**")
+        for s in panel_strikes_list:
+            series = build_vwap_series("pe", s)
+            if series.dropna().empty:
+                continue
+            last_row = latest_df.loc[latest_df["strike"] == s]
+            pe_iv = float(last_row["pe_iv"].iloc[0]) if not last_row.empty and pd.notna(last_row["pe_iv"].iloc[0]) else 0.0
+            theo = bs_theoretical(spot, s, t_years, risk_free, div_yield, pe_iv, call=False)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=series["ts"], y=series["ltp"], name=f"{s} PE LTP"))
+            fig.add_trace(go.Scatter(x=series["ts"], y=series["vwap"], name="VWAP"))
+            fig.update_layout(title=f"{s} PE — Theoretical: {theo:.2f}", xaxis_title="Time", yaxis_title="Price")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ========================
+    # CE–PE Premium Crossover around ATM (quick view)
+    # ========================
+    st.subheader("📈 CE–PE Premium Crossover (ATM ± near strikes)")
+    if np.isfinite(atm):
+        strikes_window = [atm + i * STRIKE_STEP for i in range(-near_strikes, near_strikes + 1)]
+        cross_df = latest_df[latest_df["strike"].isin(strikes_window)].copy()
+    else:
+        cross_df = pd.DataFrame()
     if cross_df.empty:
         st.warning("No strikes found in ATM window.")
     else:
@@ -580,35 +664,97 @@ if not st.session_state.history_wide.empty:
         fig_cross.add_trace(go.Scatter(x=cross_df["strike"], y=cross_df["ce_ltp"], mode="lines+markers", name="CE Premium"))
         fig_cross.add_trace(go.Scatter(x=cross_df["strike"], y=cross_df["pe_ltp"], mode="lines+markers", name="PE Premium"))
         fig_cross.add_trace(go.Scatter(x=cross_df["strike"], y=cross_df["premium_diff"], mode="lines+markers", name="CE-PE Diff"))
-        fig_cross.update_layout(title=f"CE vs PE Premium Crossover (ATM {atm_cross:.0f} ± {near_strikes})", xaxis_title="Strike", yaxis_title="Premium")
+        fig_cross.update_layout(title=f"CE vs PE Premium Crossover (ATM {atm:.0f} ± {near_strikes})", xaxis_title="Strike", yaxis_title="Premium")
         st.plotly_chart(fig_cross, use_container_width=True)
 
-    # === Trending OI (ATM ± user-selected strikes — intraday from session history) ===
-    st.subheader("⏱️ Trending OI (ATM ± user-selected strikes)")
-    def _within_mkt(ts: pd.Timestamp) -> bool:
-        if not isinstance(ts, (pd.Timestamp, dt.datetime)):
-            return False
-        t = pd.Timestamp(ts).tz_localize(None).time() if isinstance(ts, pd.Timestamp) and ts.tzinfo else pd.Timestamp(ts).time()
-        return dt.time(9, 15) <= t <= dt.time(15, 30)
+    # ========================
+    # 3-MINUTE OI CHANGE SECTION + ALERTS
+    # ========================
+    st.markdown("---")
+    st.subheader("⏱️ 3-Minute OI & Price Movement (auto)")
 
-    day_hist = hist[hist["ts"].apply(_within_mkt)]
-    if not day_hist.empty:
-        first_ts = day_hist["ts"].min()
-        base_atm = infer_atm_strike(day_hist[day_hist["ts"] == first_ts])
-        strikes_window = [base_atm + i * STRIKE_STEP for i in range(-trending_k, trending_k + 1)] if np.isfinite(base_atm) else []
-        day_win = day_hist[day_hist["strike"].isin(strikes_window)] if strikes_window else pd.DataFrame()
-        if not day_win.empty:
-            tot_by_ts = day_win.groupby("ts", as_index=False).agg(ce_oi=("ce_oi", "sum"), pe_oi=("pe_oi", "sum"))
-            fig_day = go.Figure()
-            fig_day.add_trace(go.Scatter(x=tot_by_ts["ts"], y=tot_by_ts["ce_oi"], name="CE OI"))
-            fig_day.add_trace(go.Scatter(x=tot_by_ts["ts"], y=tot_by_ts["pe_oi"], name="PE OI"))
-            st.plotly_chart(fig_day, use_container_width=True)
+    def build_buildup_label(oi_3m: float, px_3m: float) -> str:
+        return classify_buildup(oi_3m, px_3m)
 
-# ------------------------
-# RAW SNAPSHOT (debug/inspection)
-# ------------------------
+    if ts_3m is not None and not three_min_df.empty:
+        # Prepare ATM ± N table for alerts
+        if np.isfinite(atm):
+            alert_strikes = set([atm + i * STRIKE_STEP for i in range(-near_strikes, near_strikes + 1)])
+        else:
+            alert_strikes = set(three_min_df["strike"].unique()[: (2 * near_strikes + 1)])
+
+        disp = three_min_df.copy()
+        disp["CE Buildup (3m)"] = [build_buildup_label(o, p) for o, p in zip(disp["ce_oi_3m"], disp["ce_ltp_3m"])]
+        disp["PE Buildup (3m)"] = [build_buildup_label(o, p) for o, p in zip(disp["pe_oi_3m"], disp["pe_ltp_3m"])]
+        show_cols = [
+            "strike",
+            "ce_oi_3m", "ce_oi_3m_pct", "ce_ltp_3m", "CE Buildup (3m)",
+            "pe_oi_3m", "pe_oi_3m_pct", "pe_ltp_3m", "PE Buildup (3m)",
+        ]
+        st.caption(f"Comparing {latest_ts} vs {ts_3m} (~3 minutes apart)")
+        st.dataframe(disp[show_cols].sort_values("strike"), use_container_width=True)
+
+        # SUDDEN SPIKES block
+        spikes = disp[(disp["spike_flag"])].copy()
+        st.subheader("⚡ Sudden OI Spike (≥ threshold in 3-min window)")
+        if spikes.empty:
+            st.info("No spike detected in last ~3 minutes.")
+        else:
+            st.dataframe(spikes[["strike", "ce_oi_3m_pct", "pe_oi_3m_pct", "ce_oi_3m", "pe_oi_3m"]].sort_values("strike"),
+                         use_container_width=True)
+
+        # Telegram alerts
+        def maybe_send_alerts():
+            # Rate limit to once per ~3min refresh (based on ts_3m pair)
+            key = (str(ts_3m), str(latest_ts))
+            if st.session_state.last_alert_ts == key:
+                return
+            st.session_state.last_alert_ts = key
+
+            # Build ATM ± near_strikes alert
+            alert_rows = disp[disp["strike"].isin(alert_strikes)].sort_values("strike")
+            if not alert_rows.empty:
+                lines = ["<b>ATM±{} OI Update ({} → {})</b>".format(near_strikes, ts_3m.strftime("%H:%M"), latest_ts.strftime("%H:%M")),
+                         f"Symbol: {SYMBOL}, ATM: {int(atm) if np.isfinite(atm) else '-'}"]
+                for _, r in alert_rows.iterrows():
+                    lines.append(
+                        f"{int(r['strike'])}: CE ΔOI {int(r['ce_oi_3m']):+}, {r['ce_oi_3m_pct']:+.1f}% | "
+                        f"PE ΔOI {int(r['pe_oi_3m']):+}, {r['pe_oi_3m_pct']:+.1f}% "
+                        f"| CE {r['CE Buildup (3m)']} / PE {r['PE Buildup (3m)']}"
+                    )
+                send_telegram(tg_token, tg_chat, "\n".join(lines))
+
+            # Special spike alerts (unique per (ts_3m, latest_ts, strike))
+            if not spikes.empty:
+                new_spikes = []
+                for _, r in spikes.iterrows():
+                    sid = f"{int(r['strike'])}_{ts_3m.strftime('%H%M')}_{latest_ts.strftime('%H%M')}"
+                    if sid not in st.session_state.last_spike_ids:
+                        new_spikes.append(r)
+                        st.session_state.last_spike_ids.add(sid)
+                if new_spikes:
+                    lines = ["<b>⚡ Sudden OI Spike Alert</b>",
+                             f"{SYMBOL} ({ts_3m.strftime('%H:%M')} → {latest_ts.strftime('%H:%M')}) | Threshold: {oi_alert_pct}%"]
+                    for r in new_spikes:
+                        lines.append(
+                            f"{int(r['strike'])}: CE {r['ce_oi_3m_pct']:+.1f}% | PE {r['pe_oi_3m_pct']:+.1f}% "
+                            f"(Δ CE {int(r['ce_oi_3m']):+}, Δ PE {int(r['pe_oi_3m']):+})"
+                        )
+                    send_telegram(tg_token, tg_chat, "\n".join(lines))
+
+        if tg_enable and tg_token and tg_chat:
+            maybe_send_alerts()
+        elif tg_enable:
+            st.warning("Telegram enabled but Bot Token / Chat ID missing.")
+
+    else:
+        st.info("Need a few snapshots to compute 3-minute changes.")
+
+# ========================
+# RAW SNAPSHOT
+# ========================
 with st.expander("🔎 Raw Latest Snapshot"):
-    st.dataframe(df_en.sort_values(["strike", "option_type"]))
+    st.dataframe(df_en.sort_values(["strike", "option_type"]), use_container_width=True)
 
 st.markdown("---")
 st.caption("This dashboard fetches NSE option-chain live and refreshes automatically. Intraday trends are from in-session history only. Use with caution.")
