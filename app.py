@@ -249,21 +249,6 @@ if "history_wide" not in st.session_state:
 try:
     status.info("Fetching option-chain from NSE...")
     curr = fetch_option_chain(SYMBOL)
-    # ---- Expiry selector (sidebar) ----
-if "expiry" in curr.columns and not curr.empty:
-    # unique & sorted (by actual date)
-    _exps = (
-        pd.Series(curr["expiry"].dropna().astype(str).unique())
-        .sort_values(key=lambda s: pd.to_datetime(s, errors="coerce"))
-        .tolist()
-    )
-    _default = _pick_default_expiry(_exps) or (_exps[0] if _exps else None)
-    _default_index = _exps.index(_default) if (_default in _exps) else max(0, len(_exps) - 1)
-
-    chosen_expiry = st.sidebar.selectbox("Expiry", _exps, index=_default_index)
-    curr = curr[curr["expiry"].astype(str) == str(chosen_expiry)].copy()
-else:
-    st.sidebar.caption("Expiry filter unavailable (no 'expiry' column in data).")
     if curr.empty:
         status.error("Failed to fetch data from NSE (empty). Try again shortly.")
         st.stop()
