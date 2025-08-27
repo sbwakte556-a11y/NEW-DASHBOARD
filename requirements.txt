@@ -1,0 +1,8 @@
+streamlit>=1.36
+pandas>=2.2
+numpy>=1.26
+requests>=2.32
+plotly>=5.22
+streamlit-autorefresh>=1.0
+pytz>=2024.1
+st-aggrid>=0.3.4
