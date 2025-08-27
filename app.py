@@ -2,6 +2,8 @@
 from __future__ import annotations
 import math
 import time
+import json
+from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 import requests
 import pandas as pd
@@ -42,6 +44,28 @@ DEFAULT_DIV_YIELD = 0.0
 
 BULLISH_BUILDS = {"Long Buildup", "Short Covering"}
 BEARISH_BUILDS = {"Short Buildup", "Long Unwinding"}
+
+# ========================
+# PERSISTENT SETTINGS (Telegram)
+# ========================
+TG_SETTINGS_PATH = Path.home() / ".streamlit" / "tg_settings.json"
+
+def load_tg_settings() -> Dict[str, str | bool]:
+    try:
+        if TG_SETTINGS_PATH.exists():
+            return json.loads(TG_SETTINGS_PATH.read_text())
+    except Exception:
+        pass
+    return {"enable": False, "token": "", "chat_id": ""}
+
+def save_tg_settings(data: Dict[str, str | bool]) -> bool:
+    try:
+        TG_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TG_SETTINGS_PATH.write_text(json.dumps(data))
+        return True
+    except Exception as e:
+        st.sidebar.warning(f"Couldn't save Telegram settings: {e}")
+        return False
 
 # ========================
 # UTILS
@@ -100,8 +124,7 @@ def fetch_option_chain(symbol: str) -> pd.DataFrame:
                 "option_type": side,
                 "ltp": float(leg.get("lastPrice") or 0.0),
                 "oi": float(leg.get("openInterest") or 0.0),
-                # NOTE: NSE returns totalTradedVolume (cumulative). We’ll compute flow per refresh.
-                "volume_total": float(leg.get("totalTradedVolume") or 0.0),
+                "volume_total": float(leg.get("totalTradedVolume") or 0.0),  # cumulative
                 "iv": float(leg.get("impliedVolatility") or 0.0),
                 "ts": ts,
                 "spot": float(spot or 0.0),
@@ -125,41 +148,29 @@ def classify_buildup(oi_change: float, ltp_change: float) -> str:
         return "Short Covering"
     return "Neutral"
 
-# === ROBUST enrich_with_prev (handles absence of volume_total in prev) ===
+# Robust enrich_with_prev (handles absence of volume_total in prev)
 def enrich_with_prev(curr: pd.DataFrame, prev: Optional[pd.DataFrame]) -> pd.DataFrame:
     if curr.empty:
         return curr
 
     df = curr.copy()
-
-    # Current snapshot volume column (tolerate either volume_total or volume)
     curr_vol_col = "volume_total" if "volume_total" in df.columns else ("volume" if "volume" in df.columns else None)
 
     if prev is None or getattr(prev, "empty", True):
-        # First run — seed prev_* with current values
         df["prev_ltp"] = df["ltp"]
         df["prev_oi"] = df["oi"]
         df["prev_volume_total"] = df[curr_vol_col] if curr_vol_col else 0.0
     else:
-        # Figure out which volume column exists in prev snapshot
         prev_vol_col = "volume_total" if "volume_total" in prev.columns else ("volume" if "volume" in prev.columns else None)
-
         merge_cols = ["symbol", "strike", "option_type", "ltp", "oi"]
         if prev_vol_col:
             merge_cols.append(prev_vol_col)
-
-        m = prev[merge_cols].rename(columns={
-            "ltp": "prev_ltp",
-            "oi": "prev_oi",
-        })
+        m = prev[merge_cols].rename(columns={"ltp": "prev_ltp", "oi": "prev_oi"})
         if prev_vol_col:
             m.rename(columns={prev_vol_col: "prev_volume_total"}, inplace=True)
         else:
             m["prev_volume_total"] = 0.0
-
         df = df.merge(m, on=["symbol", "strike", "option_type"], how="left")
-
-        # Backfill missing prev_* with current values
         df["prev_ltp"] = df["prev_ltp"].fillna(df["ltp"])
         df["prev_oi"] = df["prev_oi"].fillna(df["oi"])
         if curr_vol_col:
@@ -167,18 +178,11 @@ def enrich_with_prev(curr: pd.DataFrame, prev: Optional[pd.DataFrame]) -> pd.Dat
         else:
             df["prev_volume_total"] = df["prev_volume_total"].fillna(0.0)
 
-    # One-interval deltas
     df["oi_chg"] = df["oi"] - df["prev_oi"]
     df["ltp_chg"] = df["ltp"] - df["prev_ltp"]
     df["oi_chg_pct"] = np.where(df["prev_oi"] > 0, 100 * df["oi_chg"] / df["prev_oi"], np.where(df["oi_chg"] > 0, 100, 0))
     df["ltp_chg_pct"] = np.where(df["prev_ltp"] > 0, 100 * df["ltp_chg"] / df["prev_ltp"], 0.0)
-
-    # Per-interval traded volume (for VWAP)
-    if curr_vol_col:
-        df["vol_flow"] = (df[curr_vol_col] - df["prev_volume_total"]).clip(lower=0)
-    else:
-        df["vol_flow"] = 0.0
-
+    df["vol_flow"] = (df[curr_vol_col] - df["prev_volume_total"]).clip(lower=0) if curr_vol_col else 0.0
     df["buildup"] = [classify_buildup(o, p) for o, p in zip(df["oi_chg"], df["ltp_chg"])]
     return df
 
@@ -249,13 +253,12 @@ def style_oi_change(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     return df.style.apply(_row_style, axis=1)
 
 # ========================
-# BLACK–SCHOLES (theoretical premium)
+# BLACK–SCHOLES
 # ========================
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def bs_theoretical(spot: float, strike: float, t_years: float, r: float, q: float, iv_pct: float, call: bool) -> float:
-    """European BS for index options. iv_pct is IV in percent (e.g. 15.0)."""
     if t_years <= 0 or iv_pct <= 0 or spot <= 0 or strike <= 0:
         return 0.0
     sigma = iv_pct / 100.0
@@ -270,7 +273,6 @@ def bs_theoretical(spot: float, strike: float, t_years: float, r: float, q: floa
         return 0.0
 
 def years_to_expiry(expiry_str: str, now_ts: pd.Timestamp) -> float:
-    # Consider expiry at 15:30 IST on the date
     try:
         d = pd.to_datetime(expiry_str)
         expiry_dt = pd.Timestamp(year=d.year, month=d.month, day=d.day, hour=15, minute=30, tz=IST)
@@ -311,10 +313,29 @@ enable_auto = st.sidebar.toggle("Auto refresh on", value=True)
 if enable_auto:
     st_autorefresh(interval=int(refresh_secs * 1000), key="auto_refresh")
 
+# Telegram (persistent)
 st.sidebar.markdown("### Telegram Alerts")
-tg_enable = st.sidebar.toggle("Enable Telegram Alerts (every ~3 minutes)", value=False)
-tg_token = st.sidebar.text_input("Bot Token", type="password")
-tg_chat = st.sidebar.text_input("Chat ID")
+_saved = load_tg_settings()
+if "tg_settings" not in st.session_state:
+    st.session_state.tg_settings = _saved.copy()
+
+tg_enable = st.sidebar.toggle("Enable Telegram Alerts (every ~3 minutes)", value=st.session_state.tg_settings.get("enable", False), key="tg_enable")
+tg_token = st.sidebar.text_input("Bot Token", type="password", value=st.session_state.tg_settings.get("token", ""), key="tg_token")
+tg_chat = st.sidebar.text_input("Chat ID", value=st.session_state.tg_settings.get("chat_id", ""), key="tg_chat")
+
+csa, csb = st.sidebar.columns(2)
+if csa.button("💾 Save Telegram"):
+    saved = {"enable": st.session_state.tg_enable, "token": st.session_state.tg_token, "chat_id": st.session_state.tg_chat}
+    if save_tg_settings(saved):
+        st.session_state.tg_settings = saved
+        st.sidebar.success("Telegram settings saved.")
+if csb.button("🧹 Clear Telegram"):
+    if save_tg_settings({"enable": False, "token": "", "chat_id": ""}):
+        st.session_state.tg_settings = {"enable": False, "token": "", "chat_id": ""}
+        st.session_state.tg_enable = False
+        st.session_state.tg_token = ""
+        st.session_state.tg_chat = ""
+        st.sidebar.success("Telegram settings cleared.")
 
 st.sidebar.button("🔄 Refresh now", on_click=lambda: st.cache_data.clear())
 
@@ -328,7 +349,7 @@ if "history_wide" not in st.session_state:
 if "last_alert_ts" not in st.session_state:
     st.session_state.last_alert_ts = None
 if "last_spike_ids" not in st.session_state:
-    st.session_state.last_spike_ids = set()   # to avoid duplicate spike pings
+    st.session_state.last_spike_ids = set()
 
 # ========================
 # FETCH
@@ -382,7 +403,7 @@ except Exception as e:
 prev = st.session_state.prev_snapshot
 df_en = enrich_with_prev(curr, prev)
 
-# Save a robust prev_snapshot that ALWAYS has volume_total
+# Save robust prev_snapshot that ALWAYS has volume_total
 _vol_col = "volume_total" if "volume_total" in curr.columns else ("volume" if "volume" in curr.columns else None)
 cols = ["symbol", "strike", "option_type", "ltp", "oi"] + ([_vol_col] if _vol_col else [])
 prev_snap = curr[cols].copy()
@@ -398,115 +419,108 @@ if not wide_latest.empty:
     st.session_state.history_wide = pd.concat([hist, wide_latest], ignore_index=True)
     if len(st.session_state.history_wide) > MAX_HISTORY_POINTS:
         st.session_state.history_wide = st.session_state.history_wide.tail(MAX_HISTORY_POINTS).reset_index(drop=True)
-        # =============== TRENDING OI TAB (history across the day) ===============
-# Adds a new tab where user selects strikes; table keeps ALL prior rows.
-main_tab, trend_tab = st.tabs(["📍 Main", "📊 Trending OI"])
 
+# ================= TRENDING OI TAB (self-contained) =================
+hist = st.session_state.history_wide.copy()
+main_tab, trend_tab = st.tabs(["📍 Main", "📊 Trending OI"])
 with trend_tab:
     st.markdown("### 📊 Trending OI — Select strikes and track every refresh (~3 min)")
-    # Helper: pick ATM for default window if available
-    def _infer_atm_for_defaults(df: pd.DataFrame) -> Optional[int]:
-        try:
-            spot_m = float(df["spot"].median()) if df["spot"].notna().any() else np.nan
-            if np.isfinite(spot_m):
-                diffs = (df["strike"] - spot_m).abs()
-                return int(df.loc[diffs.idxmin(), "strike"])
-        except Exception:
-            pass
-        return None
-
-    # Build a list of available strikes from latest snapshot
-    all_strikes = sorted(latest_df["strike"].dropna().unique().tolist())
-    # Default to ATM ± 3 strikes if possible
-    default_sel: List[int] = []
-    _atm0 = _infer_atm_for_defaults(latest_df)
-    if _atm0 is not None:
-        default_sel = [_atm0 + i * STRIKE_STEP for i in range(-3, 4) if (_atm0 + i * STRIKE_STEP) in all_strikes]
+    if hist.empty:
+        st.info("Trending OI will appear after a couple of snapshots are captured.")
     else:
-        default_sel = all_strikes[:7]
+        latest_ts_tab = hist["ts"].max()
+        latest_df_tab = hist[hist["ts"] == latest_ts_tab].copy()
 
-    user_strikes = st.multiselect("Choose strikes to track", options=all_strikes, default=default_sel, key="trending_strikes")
-
-    if not user_strikes:
-        st.info("Select one or more strikes to begin.")
-    else:
-        # Day history only (within market time) to avoid prior sessions
-        def _within_mkt(ts: pd.Timestamp) -> bool:
-            if not isinstance(ts, (pd.Timestamp, dt.datetime)):
-                return False
-            p = pd.Timestamp(ts)
-            t = (p.tz_localize(None).time() if p.tzinfo else p.time())
-            return dt.time(9, 15) <= t <= dt.time(15, 30)
-
-        day_hist = hist[hist["ts"].apply(_within_mkt)]
-        # Keep rows of chosen strikes only
-        dh = day_hist[day_hist["strike"].isin(user_strikes)].copy()
-        if dh.empty:
-            st.warning("No intraday history yet for the selected strikes.")
-        else:
-            # Aggregate by timestamp across selected strikes
-            agg = dh.groupby("ts", as_index=False).agg(
-                ce_oi=("ce_oi", "sum"),
-                pe_oi=("pe_oi", "sum"),
-                ce_ltp=("ce_ltp", "mean"),
-                pe_ltp=("pe_ltp", "mean"),
-            ).sort_values("ts")
-
-            # 3-min (one-interval) changes vs previous stored row
-            agg["ce_oi_delta"] = agg["ce_oi"].diff()
-            agg["pe_oi_delta"] = agg["pe_oi"].diff()
-            agg["ce_px_delta"] = agg["ce_ltp"].diff()
-            agg["pe_px_delta"] = agg["pe_ltp"].diff()
-
-            # Display-friendly columns
-            disp = agg.rename(columns={
-                "ts": "Time",
-                "ce_oi": "Total CE OI",
-                "ce_oi_delta": "Δ CE OI",
-                "ce_px_delta": "Δ CE Price",
-                "pe_oi": "Total PE OI",
-                "pe_oi_delta": "Δ PE OI",
-                "pe_px_delta": "Δ PE Price",
-            })
-            # Round/format a bit
-            for c in ["Total CE OI", "Δ CE OI", "Total PE OI", "Δ PE OI"]:
-                disp[c] = disp[c].round(0).astype("Int64")
-            for c in ["Δ CE Price", "Δ PE Price"]:
-                disp[c] = disp[c].round(2)
-
-            # Row-wise coloring rules:
-            # CE up (OI↑ or Price↑) -> bullish (green); CE down -> bearish (red)
-            # PE up (OI↑ or Price↑) -> bearish (red); PE down -> bullish (green)
-            def _style(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-                def color_row(row):
-                    styles = []
-                    for col in df.columns:
-                        color = ""
-                        if col in ("Δ CE OI", "Δ CE Price"):
-                            v = row[col]
-                            if pd.notna(v):
-                                color = "background-color:#e8f5e9;color:#1b5e20;" if v > 0 else ("background-color:#ffebee;color:#b71c1c;" if v < 0 else "")
-                        if col in ("Δ PE OI", "Δ PE Price"):
-                            v = row[col]
-                            if pd.notna(v):
-                                color = "background-color:#ffebee;color:#b71c1c;" if v > 0 else ("background-color:#e8f5e9;color:#1b5e20;" if v < 0 else "")
-                        styles.append(color)
-                    return styles
-                return df.style.apply(color_row, axis=1)
-
-            st.caption(f"Selected strikes: {', '.join(map(str, user_strikes))}")
+        def _infer_atm_for_defaults(df: pd.DataFrame) -> Optional[int]:
             try:
-                st.dataframe(_style(disp), use_container_width=True)
+                if "spot" in df.columns and df["spot"].notna().any():
+                    spot_m = float(df["spot"].median())
+                    diffs = (df["strike"] - spot_m).abs()
+                    return int(df.loc[diffs.idxmin(), "strike"])
             except Exception:
-                st.dataframe(disp, use_container_width=True)
+                pass
+            return None
 
-            st.markdown(
-                "<small>Notes: Totals are summed across selected strikes; price change is the mean Δ across those strikes."
-                " Table keeps all prior intervals so you can compare 9:15, 10:00, 12:00, 13:00, etc. Refresh interval = your sidebar setting.</small>",
-                unsafe_allow_html=True,
-            )
-# ============= END TRENDING OI TAB =============
+        all_strikes = sorted(latest_df_tab["strike"].dropna().unique().tolist())
+        default_sel: List[int] = []
+        _atm0 = _infer_atm_for_defaults(latest_df_tab)
+        if _atm0 is not None:
+            default_sel = [_atm0 + i * STRIKE_STEP for i in range(-3, 3 + 1) if (_atm0 + i * STRIKE_STEP) in all_strikes]
+        else:
+            default_sel = all_strikes[:7]
 
+        user_strikes = st.multiselect("Choose strikes to track", options=all_strikes, default=default_sel, key="trending_strikes")
+        if not user_strikes:
+            st.info("Select one or more strikes to begin.")
+        else:
+            def _within_mkt(ts: pd.Timestamp) -> bool:
+                if not isinstance(ts, (pd.Timestamp, dt.datetime)):
+                    return False
+                p = pd.Timestamp(ts)
+                t = (p.tz_localize(None).time() if p.tzinfo else p.time())
+                return dt.time(9, 15) <= t <= dt.time(15, 30)
+
+            day_hist = hist[hist["ts"].apply(_within_mkt)]
+            dh = day_hist[day_hist["strike"].isin(user_strikes)].copy()
+            if dh.empty:
+                st.warning("No intraday history yet for the selected strikes.")
+            else:
+                agg = dh.groupby("ts", as_index=False).agg(
+                    ce_oi=("ce_oi", "sum"),
+                    pe_oi=("pe_oi", "sum"),
+                    ce_ltp=("ce_ltp", "mean"),
+                    pe_ltp=("pe_ltp", "mean"),
+                ).sort_values("ts")
+
+                agg["ce_oi_delta"] = agg["ce_oi"].diff()
+                agg["pe_oi_delta"] = agg["pe_oi"].diff()
+                agg["ce_px_delta"] = agg["ce_ltp"].diff()
+                agg["pe_px_delta"] = agg["pe_ltp"].diff()
+
+                disp = agg.rename(columns={
+                    "ts": "Time",
+                    "ce_oi": "Total CE OI",
+                    "ce_oi_delta": "Δ CE OI",
+                    "ce_px_delta": "Δ CE Price",
+                    "pe_oi": "Total PE OI",
+                    "pe_oi_delta": "Δ PE OI",
+                    "pe_px_delta": "Δ PE Price",
+                })
+                for c in ["Total CE OI", "Δ CE OI", "Total PE OI", "Δ PE OI"]:
+                    disp[c] = disp[c].round(0).astype("Int64")
+                for c in ["Δ CE Price", "Δ PE Price"]:
+                    disp[c] = disp[c].round(2)
+
+                def _style(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+                    def color_row(row):
+                        styles = []
+                        for col in df.columns:
+                            color = ""
+                            if col in ("Δ CE OI", "Δ CE Price"):
+                                v = row[col]
+                                if pd.notna(v):
+                                    color = ("background-color:#e8f5e9;color:#1b5e20;" if v > 0
+                                             else "background-color:#ffebee;color:#b71c1c;" if v < 0 else "")
+                            if col in ("Δ PE OI", "Δ PE Price"):
+                                v = row[col]
+                                if pd.notna(v):
+                                    color = ("background-color:#ffebee;color:#b71c1c;" if v > 0
+                                             else "background-color:#e8f5e9;color:#1b5e20;" if v < 0 else "")
+                            styles.append(color)
+                        return styles
+                    return df.style.apply(color_row, axis=1)
+
+                st.caption(f"Selected strikes: {', '.join(map(str, user_strikes))}")
+                try:
+                    st.dataframe(_style(disp), use_container_width=True)
+                except Exception:
+                    st.dataframe(disp, use_container_width=True)
+
+                st.markdown(
+                    "<small>Totals are across selected strikes; Δ columns are per-refresh changes. Table keeps all prior intervals so you can compare 9:15, 10:00, 12:00, 13:00, etc.</small>",
+                    unsafe_allow_html=True,
+                )
+# =============== END TRENDING OI TAB ===============
 
 # ========================
 # HEADER METRICS & SENTIMENT
@@ -516,7 +530,6 @@ snapshot_time = pd.to_datetime(df_en["ts"].iloc[0]) if "ts" in df_en.columns els
 
 ce = df_en[df_en.option_type == "CE"].copy()
 pe = df_en[df_en.option_type == "PE"].copy()
-# Sentiment proxy: (flow * |ltp|) each side
 ce_strength = float((ce["vol_flow"].fillna(0) * ce["ltp"].abs().fillna(0)).sum())
 pe_strength = float((pe["vol_flow"].fillna(0) * pe["ltp"].abs().fillna(0)).sum())
 total_strength = (ce_strength + pe_strength) or 1.0
@@ -562,7 +575,7 @@ with c4:
 st.markdown("---")
 
 # ========================
-# NEAR-ATM TABLE (colored by buildup)
+# NEAR-ATM TABLE
 # ========================
 def select_near_atm(df: pd.DataFrame, spot_price: float, n: int) -> pd.DataFrame:
     if df.empty:
@@ -586,12 +599,11 @@ else:
 # ========================
 # HISTORY SNAPSHOT
 # ========================
-hist = st.session_state.history_wide.copy()
-if not hist.empty:
-    latest_ts = hist["ts"].max()
-    latest_df = hist[hist["ts"] == latest_ts].copy()
+hist2 = st.session_state.history_wide.copy()
+if not hist2.empty:
+    latest_ts = hist2["ts"].max()
+    latest_df = hist2[hist2["ts"] == latest_ts].copy()
 
-    # ATM metric block
     def infer_atm_strike(wide_latest: pd.DataFrame) -> float:
         spot_m = float(wide_latest["spot"].median()) if "spot" in wide_latest.columns and wide_latest["spot"].notna().any() else np.nan
         if np.isfinite(spot_m):
@@ -605,11 +617,9 @@ if not hist.empty:
     c1, c2, c3 = st.columns(3)
     c1.metric("ATM", f"{atm:.0f}" if np.isfinite(atm) else "—")
     c2.metric("Spot (median)", f"{spot_latest:,.2f}" if np.isfinite(spot_latest) else "—")
-    c3.metric("Snapshots stored", str(hist["ts"].nunique()))
+    c3.metric("Snapshots stored", str(hist2["ts"].nunique()))
 
-    # ------------------------
     # 3-MINUTE WINDOW LOGIC
-    # ------------------------
     def pick_3min_ago_ts(h: pd.DataFrame, ref_ts: pd.Timestamp) -> Optional[pd.Timestamp]:
         hts = sorted(h["ts"].unique())
         if not hts:
@@ -623,11 +633,11 @@ if not hist.empty:
             return None
         return pd.Timestamp(best)
 
-    ts_3m = pick_3min_ago_ts(hist, latest_ts)
+    ts_3m = pick_3min_ago_ts(hist2, latest_ts)
     three_min_df = pd.DataFrame()
     if ts_3m is not None:
-        last = hist[hist["ts"] == latest_ts].copy()
-        old = hist[hist["ts"] == ts_3m].copy()
+        last = hist2[hist2["ts"] == latest_ts].copy()
+        old = hist2[hist2["ts"] == ts_3m].copy()
         mcols = ["strike", "ce_oi", "pe_oi", "ce_ltp", "pe_ltp", "ce_vtot", "pe_vtot"]
         last = last[["strike"] + mcols[1:]]
         old = old[["strike"] + mcols[1:]]
@@ -642,9 +652,7 @@ if not hist.empty:
             )
         three_min_df["spike_flag"] = (three_min_df["ce_oi_3m_pct"].abs() >= oi_alert_pct) | (three_min_df["pe_oi_3m_pct"].abs() >= oi_alert_pct)
 
-    # ------------------------
-    # TOP STRIKES (ATM window)
-    # ------------------------
+    # TOP STRIKES
     if np.isfinite(atm):
         allowed = [atm + i * STRIKE_STEP for i in range(-ATM_TOP_STRIKE_SPAN, ATM_TOP_STRIKE_SPAN + 1)]
         latest_df_win = latest_df[latest_df["strike"].isin(allowed)].copy()
@@ -652,7 +660,7 @@ if not hist.empty:
         latest_df_win = latest_df.copy()
 
     st.subheader("🏆 Top Strikes — OI & Price (ATM window)")
-    top_n = st.slider("Top N", 5, 15, 10)
+    top_n = st.slider("Top N", 5, 15, 10, key="topn")
     t1, t2 = st.columns(2)
     with t1:
         st.write(f"Top CE OI (ATM ± {ATM_TOP_STRIKE_SPAN})")
@@ -665,9 +673,7 @@ if not hist.empty:
         st.write(f"Top PE Price (ATM ± {ATM_TOP_STRIKE_SPAN})")
         st.dataframe(latest_df_win.nlargest(top_n, "pe_ltp")[["strike", "pe_ltp", "pe_ltp_chg"]])
 
-    # ------------------------
     # BUILDUP TABLE ATM ±10
-    # ------------------------
     st.subheader("🧮 Buildup (ATM ±10) — PE ◀︎ | ▶︎ CE")
     band10 = [atm + i * STRIKE_STEP for i in range(-10, 11)] if np.isfinite(atm) else []
     bt = latest_df[latest_df["strike"].isin(band10)].copy() if band10 else pd.DataFrame()
@@ -714,28 +720,23 @@ if not hist.empty:
     else:
         st.info("No strikes in ATM ±10 window yet.")
 
-    # ------------------------
     # OI DISTRIBUTION
-    # ------------------------
     st.subheader("📊 OI Distribution (Green=PE writers, Red=CE writers)")
     fig_dist = go.Figure()
     fig_dist.add_trace(go.Bar(x=latest_df["strike"], y=latest_df["ce_oi"], name="CE OI", marker_color="#e53935"))
     fig_dist.add_trace(go.Bar(x=latest_df["strike"], y=latest_df["pe_oi"], name="PE OI", marker_color="#43a047"))
     fig_dist.update_layout(barmode="group", xaxis_title="Strike", yaxis_title="Open Interest")
-    st.plotly_chart(fig_dist, use_container_width=True)
+    st.plotly_chart(fig_dist, use_container_width=True, key=f"dist_{SYMBOL}_{latest_ts}")
 
-    # ========================
     # CE/PE PANEL — ATM ±7: LTP vs VWAP + Theoretical
-    # ========================
     st.subheader("🎛️ CE (left) & PE (right) Panel — LTP vs VWAP & Theoretical Premium (ATM ± selected)")
     if np.isfinite(atm):
         panel_strikes_list = [atm + i * STRIKE_STEP for i in range(-panel_strikes, panel_strikes + 1)]
     else:
         panel_strikes_list = sorted(latest_df["strike"].unique())[: (2 * panel_strikes + 1)]
 
-    # Compute per-strike VWAP from in-session history (cumulative)
     def build_vwap_series(side: str, strike_val: int) -> pd.DataFrame:
-        dfp = hist[(hist["strike"] == strike_val)].sort_values("ts").copy()
+        dfp = hist2[(hist2["strike"] == strike_val)].sort_values("ts").copy()
         px = dfp[f"{side}_ltp"].fillna(method="ffill")
         vflow = dfp[f"{side}_vflow"].fillna(0).clip(lower=0)
         cum_notional = (px * vflow).cumsum()
@@ -743,7 +744,6 @@ if not hist.empty:
         vwap = (cum_notional / cum_vol).fillna(method="bfill").fillna(method="ffill")
         return pd.DataFrame({"ts": dfp["ts"], "ltp": px, "vwap": vwap})
 
-    # Time to expiry in years (for theoretical)
     t_years = years_to_expiry(str(chosen_expiry) if chosen_expiry else "", pd.Timestamp(snapshot_time))
 
     ce_col, pe_col = st.columns(2)
@@ -760,7 +760,7 @@ if not hist.empty:
             fig.add_trace(go.Scatter(x=series["ts"], y=series["ltp"], name=f"{s} CE LTP"))
             fig.add_trace(go.Scatter(x=series["ts"], y=series["vwap"], name="VWAP"))
             fig.update_layout(title=f"{s} CE — Theoretical: {theo:.2f}", xaxis_title="Time", yaxis_title="Price")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"ce_panel_{SYMBOL}_{s}_{latest_ts}")
 
     with pe_col:
         st.markdown("**PE Strikes**")
@@ -775,11 +775,9 @@ if not hist.empty:
             fig.add_trace(go.Scatter(x=series["ts"], y=series["ltp"], name=f"{s} PE LTP"))
             fig.add_trace(go.Scatter(x=series["ts"], y=series["vwap"], name="VWAP"))
             fig.update_layout(title=f"{s} PE — Theoretical: {theo:.2f}", xaxis_title="Time", yaxis_title="Price")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"pe_panel_{SYMBOL}_{s}_{latest_ts}")
 
-    # ========================
     # CE–PE Premium Crossover around ATM
-    # ========================
     st.subheader("📈 CE–PE Premium Crossover (ATM ± near strikes)")
     if np.isfinite(atm):
         strikes_window = [atm + i * STRIKE_STEP for i in range(-near_strikes, near_strikes + 1)]
@@ -795,11 +793,9 @@ if not hist.empty:
         fig_cross.add_trace(go.Scatter(x=cross_df["strike"], y=cross_df["pe_ltp"], mode="lines+markers", name="PE Premium"))
         fig_cross.add_trace(go.Scatter(x=cross_df["strike"], y=cross_df["premium_diff"], mode="lines+markers", name="CE-PE Diff"))
         fig_cross.update_layout(title=f"CE vs PE Premium Crossover (ATM {atm:.0f} ± {near_strikes})", xaxis_title="Strike", yaxis_title="Premium")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig_cross, use_container_width=True, key=f"cross_{SYMBOL}_{latest_ts}")
 
-    # ========================
     # 3-MINUTE OI CHANGE SECTION + ALERTS
-    # ========================
     st.markdown("---")
     st.subheader("⏱️ 3-Minute OI & Price Movement (auto)")
 
@@ -820,7 +816,6 @@ if not hist.empty:
         st.caption(f"Comparing {latest_ts} vs {ts_3m} (~3 minutes apart)")
         st.dataframe(disp[show_cols].sort_values("strike"), use_container_width=True)
 
-        # SUDDEN SPIKES block
         spikes = disp[(disp["spike_flag"])].copy()
         st.subheader("⚡ Sudden OI Spike (≥ threshold in 3-min window)")
         if spikes.empty:
@@ -829,12 +824,16 @@ if not hist.empty:
             st.dataframe(spikes[["strike", "ce_oi_3m_pct", "pe_oi_3m_pct", "ce_oi_3m", "pe_oi_3m"]].sort_values("strike"),
                          use_container_width=True)
 
-        # Telegram alerts
+        # Telegram alerts (use persisted settings)
         def maybe_send_alerts():
             key = (str(ts_3m), str(latest_ts))
             if st.session_state.last_alert_ts == key:
                 return
             st.session_state.last_alert_ts = key
+
+            settings = st.session_state.tg_settings
+            if not settings.get("enable") or not settings.get("token") or not settings.get("chat_id"):
+                return
 
             # ATM ± near_strikes alert
             alert_rows = disp[disp["strike"].isin(alert_strikes)].sort_values("strike")
@@ -847,7 +846,7 @@ if not hist.empty:
                         f"PE ΔOI {int(r['pe_oi_3m']):+}, {r['pe_oi_3m_pct']:+.1f}% "
                         f"| CE {r['CE Buildup (3m)']} / PE {r['PE Buildup (3m)']}"
                     )
-                send_telegram(tg_token, tg_chat, "\n".join(lines))
+                send_telegram(settings["token"], settings["chat_id"], "\n".join(lines))
 
             # Spike alerts (dedup)
             if not spikes.empty:
@@ -865,12 +864,9 @@ if not hist.empty:
                             f"{int(r['strike'])}: CE {r['ce_oi_3m_pct']:+.1f}% | PE {r['pe_oi_3m_pct']:+.1f}% "
                             f"(Δ CE {int(r['ce_oi_3m']):+}, Δ PE {int(r['pe_oi_3m']):+})"
                         )
-                    send_telegram(tg_token, tg_chat, "\n".join(lines))
+                    send_telegram(settings["token"], settings["chat_id"], "\n".join(lines))
 
-        if tg_enable and tg_token and tg_chat:
-            maybe_send_alerts()
-        elif tg_enable:
-            st.warning("Telegram enabled but Bot Token / Chat ID missing.")
+        maybe_send_alerts()
     else:
         st.info("Need a few snapshots to compute 3-minute changes.")
 
@@ -882,5 +878,3 @@ with st.expander("🔎 Raw Latest Snapshot"):
 
 st.markdown("---")
 st.caption("This dashboard fetches NSE option-chain live and refreshes automatically. Intraday trends are from in-session history only. Use with caution.")
-
-
