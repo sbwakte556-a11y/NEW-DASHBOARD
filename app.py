@@ -34,7 +34,7 @@ DEFAULT_SYMBOL = "NIFTY"
 STRIKE_STEP = 50
 REFRESH_SECS_DEFAULT = 180
 NEAR_STRIKES_DEFAULT = 3           # for alerting (ATM ±3)
-PANEL_STRIKES_DEFAULT = 7          # for LTP vs VWAP panel (ATM ±7)
+PANEL_STRIKES_DEFAULT = 7          # for CE/PE panel (ATM ±7)
 MAX_HISTORY_POINTS = 2000
 ATM_TOP_STRIKE_SPAN = 5            # top table window
 DEFAULT_RISK_FREE = 0.0675         # 6.75% annual
@@ -63,7 +63,7 @@ def make_session() -> requests.Session:
 
 @st.cache_data(show_spinner=False, ttl=10)
 def fetch_option_chain(symbol: str) -> pd.DataFrame:
-    """Return tidy long DataFrame with: symbol, strike, option_type, ltp, oi, volume, iv, ts, spot, expiry"""
+    """Return tidy long DataFrame with: symbol, strike, option_type, ltp, oi, volume_total, iv, ts, spot, expiry"""
     url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     s = make_session()
     headers = {"accept": "application/json, text/plain, */*", "referer": "https://www.nseindia.com/option-chain"}
@@ -100,7 +100,8 @@ def fetch_option_chain(symbol: str) -> pd.DataFrame:
                 "option_type": side,
                 "ltp": float(leg.get("lastPrice") or 0.0),
                 "oi": float(leg.get("openInterest") or 0.0),
-                "volume_total": float(leg.get("totalTradedVolume") or 0.0),  # cumulative total from NSE
+                # NOTE: NSE returns totalTradedVolume (cumulative). We’ll compute flow per refresh.
+                "volume_total": float(leg.get("totalTradedVolume") or 0.0),
                 "iv": float(leg.get("impliedVolatility") or 0.0),
                 "ts": ts,
                 "spot": float(spot or 0.0),
@@ -124,20 +125,47 @@ def classify_buildup(oi_change: float, ltp_change: float) -> str:
         return "Short Covering"
     return "Neutral"
 
+# === ROBUST enrich_with_prev (handles absence of volume_total in prev) ===
 def enrich_with_prev(curr: pd.DataFrame, prev: Optional[pd.DataFrame]) -> pd.DataFrame:
     if curr.empty:
         return curr
+
     df = curr.copy()
-    if prev is None or prev.empty:
-        df["prev_ltp"], df["prev_oi"], df["prev_volume_total"] = df["ltp"], df["oi"], df["volume_total"]
+
+    # Current snapshot volume column (tolerate either volume_total or volume)
+    curr_vol_col = "volume_total" if "volume_total" in df.columns else ("volume" if "volume" in df.columns else None)
+
+    if prev is None or getattr(prev, "empty", True):
+        # First run — seed prev_* with current values
+        df["prev_ltp"] = df["ltp"]
+        df["prev_oi"] = df["oi"]
+        df["prev_volume_total"] = df[curr_vol_col] if curr_vol_col else 0.0
     else:
-        m = prev[["symbol", "strike", "option_type", "ltp", "oi", "volume_total"]].rename(
-            columns={"ltp": "prev_ltp", "oi": "prev_oi", "volume_total": "prev_volume_total"}
-        )
+        # Figure out which volume column exists in prev snapshot
+        prev_vol_col = "volume_total" if "volume_total" in prev.columns else ("volume" if "volume" in prev.columns else None)
+
+        merge_cols = ["symbol", "strike", "option_type", "ltp", "oi"]
+        if prev_vol_col:
+            merge_cols.append(prev_vol_col)
+
+        m = prev[merge_cols].rename(columns={
+            "ltp": "prev_ltp",
+            "oi": "prev_oi",
+        })
+        if prev_vol_col:
+            m.rename(columns={prev_vol_col: "prev_volume_total"}, inplace=True)
+        else:
+            m["prev_volume_total"] = 0.0
+
         df = df.merge(m, on=["symbol", "strike", "option_type"], how="left")
+
+        # Backfill missing prev_* with current values
         df["prev_ltp"] = df["prev_ltp"].fillna(df["ltp"])
         df["prev_oi"] = df["prev_oi"].fillna(df["oi"])
-        df["prev_volume_total"] = df["prev_volume_total"].fillna(df["volume_total"])
+        if curr_vol_col:
+            df["prev_volume_total"] = df["prev_volume_total"].fillna(df[curr_vol_col]).fillna(0.0)
+        else:
+            df["prev_volume_total"] = df["prev_volume_total"].fillna(0.0)
 
     # One-interval deltas
     df["oi_chg"] = df["oi"] - df["prev_oi"]
@@ -145,8 +173,11 @@ def enrich_with_prev(curr: pd.DataFrame, prev: Optional[pd.DataFrame]) -> pd.Dat
     df["oi_chg_pct"] = np.where(df["prev_oi"] > 0, 100 * df["oi_chg"] / df["prev_oi"], np.where(df["oi_chg"] > 0, 100, 0))
     df["ltp_chg_pct"] = np.where(df["prev_ltp"] > 0, 100 * df["ltp_chg"] / df["prev_ltp"], 0.0)
 
-    # Volume flow for VWAP (per-interval traded volume)
-    df["vol_flow"] = (df["volume_total"] - df["prev_volume_total"]).clip(lower=0)
+    # Per-interval traded volume (for VWAP)
+    if curr_vol_col:
+        df["vol_flow"] = (df[curr_vol_col] - df["prev_volume_total"]).clip(lower=0)
+    else:
+        df["vol_flow"] = 0.0
 
     df["buildup"] = [classify_buildup(o, p) for o, p in zip(df["oi_chg"], df["ltp_chg"])]
     return df
@@ -157,18 +188,6 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
     df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
     df = df.dropna(subset=["strike"])
 
-    agg = {
-        "oi": "sum",
-        "ltp": "mean",
-        "iv": "mean",
-        "vol_flow": "sum",
-        "volume_total": "sum",
-    }
-    piv = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values=agg, aggfunc="sum")
-    # Flatten columns
-    piv.columns = [f"{side}_{col}" for col in piv.columns.get_level_values(0) for col in [piv.columns.get_level_values(1)[0]]]
-    # The above is a bit ugly due to pivot_table; re-assemble cleanly:
-    # We'll rebuild with separate pivots for clarity
     piv_oi = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values="oi", aggfunc="sum")
     piv_ltp = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values="ltp", aggfunc="mean")
     piv_iv = df.pivot_table(index=["ts", "spot", "strike"], columns="option_type", values="iv", aggfunc="mean")
@@ -177,7 +196,7 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
 
     wide = pd.concat([
         piv_oi.rename(columns={"CE": "ce_oi", "PE": "pe_oi"}),
-        piv_ltp.rename(columns={"CE": "ce_ltp", "PE": "pe_ltp"}),
+        piv_ltp.rename(columns={"CE": "ce_ltp", "PE": "pe_ltp"]),
         piv_iv.rename(columns={"CE": "ce_iv", "PE": "pe_iv"}),
         piv_vflow.rename(columns={"CE": "ce_vflow", "PE": "pe_vflow"}),
         piv_vtot.rename(columns={"CE": "ce_vtot", "PE": "pe_vtot"}),
@@ -187,7 +206,6 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
         if c not in wide.columns:
             wide[c] = np.nan
 
-    # One-interval changes (by strike)
     wide = wide.sort_values(["strike", "ts"]).reset_index(drop=True)
     wide["ce_oi_chg"] = wide.groupby("strike")["ce_oi"].diff()
     wide["pe_oi_chg"] = wide.groupby("strike")["pe_oi"].diff()
@@ -256,7 +274,6 @@ def years_to_expiry(expiry_str: str, now_ts: pd.Timestamp) -> float:
     try:
         d = pd.to_datetime(expiry_str)
         expiry_dt = pd.Timestamp(year=d.year, month=d.month, day=d.day, hour=15, minute=30, tz=IST)
-        # if already past, zero
         delta = max((expiry_dt - now_ts).total_seconds(), 0.0)
         return delta / (365.0 * 24 * 3600.0)
     except Exception:
@@ -327,6 +344,7 @@ try:
     curr = fetch_option_chain(SYMBOL)
 
     # Expiry selection with Weekly/Monthly
+    chosen_expiry = None
     if ("expiry" in curr.columns) and (not curr.empty):
         _exps_all = (
             pd.Series(curr["expiry"].dropna().astype(str).unique())
@@ -363,7 +381,16 @@ except Exception as e:
 # ========================
 prev = st.session_state.prev_snapshot
 df_en = enrich_with_prev(curr, prev)
-st.session_state.prev_snapshot = curr[["symbol", "strike", "option_type", "ltp", "oi", "volume_total"]].copy()
+
+# Save a robust prev_snapshot that ALWAYS has volume_total
+_vol_col = "volume_total" if "volume_total" in curr.columns else ("volume" if "volume" in curr.columns else None)
+cols = ["symbol", "strike", "option_type", "ltp", "oi"] + ([_vol_col] if _vol_col else [])
+prev_snap = curr[cols].copy()
+if _vol_col:
+    prev_snap.rename(columns={_vol_col: "volume_total"}, inplace=True)
+else:
+    prev_snap["volume_total"] = 0.0
+st.session_state.prev_snapshot = prev_snap
 
 wide_latest = make_wide(df_en)
 if not wide_latest.empty:
@@ -380,7 +407,7 @@ snapshot_time = pd.to_datetime(df_en["ts"].iloc[0]) if "ts" in df_en.columns els
 
 ce = df_en[df_en.option_type == "CE"].copy()
 pe = df_en[df_en.option_type == "PE"].copy()
-# A balanced sentiment proxy: volume*|price change| on each side
+# Sentiment proxy: (flow * |ltp|) each side
 ce_strength = float((ce["vol_flow"].fillna(0) * ce["ltp"].abs().fillna(0)).sum())
 pe_strength = float((pe["vol_flow"].fillna(0) * pe["ltp"].abs().fillna(0)).sum())
 total_strength = (ce_strength + pe_strength) or 1.0
@@ -478,13 +505,11 @@ if not hist.empty:
         hts = sorted(h["ts"].unique())
         if not hts:
             return None
-        # find the timestamp closest to ref_ts - 3 minutes (within 1–5 min tolerance)
         target = pd.Timestamp(ref_ts) - pd.Timedelta(minutes=3)
         candidates = [t for t in hts if (ref_ts - pd.Timestamp(t)) >= pd.Timedelta(minutes=1)]
         if not candidates:
             return None
         best = min(candidates, key=lambda t: abs((pd.Timestamp(t) - target).total_seconds()))
-        # sanity: don't compare if farther than 5 minutes
         if abs((pd.Timestamp(best) - target).total_seconds()) > 5 * 60:
             return None
         return pd.Timestamp(best)
@@ -492,7 +517,6 @@ if not hist.empty:
     ts_3m = pick_3min_ago_ts(hist, latest_ts)
     three_min_df = pd.DataFrame()
     if ts_3m is not None:
-        # Create a 3-min delta view by merging strikes at latest_ts vs ts_3m
         last = hist[hist["ts"] == latest_ts].copy()
         old = hist[hist["ts"] == ts_3m].copy()
         mcols = ["strike", "ce_oi", "pe_oi", "ce_ltp", "pe_ltp", "ce_vtot", "pe_vtot"]
@@ -507,8 +531,6 @@ if not hist.empty:
                 100 * three_min_df[f"{side}_oi_3m"] / three_min_df[f"{side}_oi_old"],
                 np.where(three_min_df[f"{side}_oi_3m"] > 0, 100, 0)
             )
-
-        # Spike detection
         three_min_df["spike_flag"] = (three_min_df["ce_oi_3m_pct"].abs() >= oi_alert_pct) | (three_min_df["pe_oi_3m_pct"].abs() >= oi_alert_pct)
 
     # ------------------------
@@ -602,19 +624,18 @@ if not hist.empty:
     else:
         panel_strikes_list = sorted(latest_df["strike"].unique())[: (2 * panel_strikes + 1)]
 
-    # Compute per-strike VWAP from in-session history (cumulative over time)
+    # Compute per-strike VWAP from in-session history (cumulative)
     def build_vwap_series(side: str, strike_val: int) -> pd.DataFrame:
-        df = hist[(hist["strike"] == strike_val)].sort_values("ts").copy()
-        px = df[f"{side}_ltp"].fillna(method="ffill")
-        vflow = df[f"{side}_vflow"].fillna(0).clip(lower=0)
-        # cumulative VWAP
+        dfp = hist[(hist["strike"] == strike_val)].sort_values("ts").copy()
+        px = dfp[f"{side}_ltp"].fillna(method="ffill")
+        vflow = dfp[f"{side}_vflow"].fillna(0).clip(lower=0)
         cum_notional = (px * vflow).cumsum()
         cum_vol = vflow.cumsum().replace(0, np.nan)
         vwap = (cum_notional / cum_vol).fillna(method="bfill").fillna(method="ffill")
-        return pd.DataFrame({"ts": df["ts"], "ltp": px, "vwap": vwap})
+        return pd.DataFrame({"ts": dfp["ts"], "ltp": px, "vwap": vwap})
 
     # Time to expiry in years (for theoretical)
-    t_years = years_to_expiry(str(chosen_expiry) if "chosen_expiry" in locals() else "", pd.Timestamp(snapshot_time))
+    t_years = years_to_expiry(str(chosen_expiry) if chosen_expiry else "", pd.Timestamp(snapshot_time))
 
     ce_col, pe_col = st.columns(2)
     with ce_col:
@@ -648,7 +669,7 @@ if not hist.empty:
             st.plotly_chart(fig, use_container_width=True)
 
     # ========================
-    # CE–PE Premium Crossover around ATM (quick view)
+    # CE–PE Premium Crossover around ATM
     # ========================
     st.subheader("📈 CE–PE Premium Crossover (ATM ± near strikes)")
     if np.isfinite(atm):
@@ -665,7 +686,7 @@ if not hist.empty:
         fig_cross.add_trace(go.Scatter(x=cross_df["strike"], y=cross_df["pe_ltp"], mode="lines+markers", name="PE Premium"))
         fig_cross.add_trace(go.Scatter(x=cross_df["strike"], y=cross_df["premium_diff"], mode="lines+markers", name="CE-PE Diff"))
         fig_cross.update_layout(title=f"CE vs PE Premium Crossover (ATM {atm:.0f} ± {near_strikes})", xaxis_title="Strike", yaxis_title="Premium")
-        st.plotly_chart(fig_cross, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
 
     # ========================
     # 3-MINUTE OI CHANGE SECTION + ALERTS
@@ -673,19 +694,15 @@ if not hist.empty:
     st.markdown("---")
     st.subheader("⏱️ 3-Minute OI & Price Movement (auto)")
 
-    def build_buildup_label(oi_3m: float, px_3m: float) -> str:
-        return classify_buildup(oi_3m, px_3m)
-
     if ts_3m is not None and not three_min_df.empty:
-        # Prepare ATM ± N table for alerts
         if np.isfinite(atm):
             alert_strikes = set([atm + i * STRIKE_STEP for i in range(-near_strikes, near_strikes + 1)])
         else:
             alert_strikes = set(three_min_df["strike"].unique()[: (2 * near_strikes + 1)])
 
         disp = three_min_df.copy()
-        disp["CE Buildup (3m)"] = [build_buildup_label(o, p) for o, p in zip(disp["ce_oi_3m"], disp["ce_ltp_3m"])]
-        disp["PE Buildup (3m)"] = [build_buildup_label(o, p) for o, p in zip(disp["pe_oi_3m"], disp["pe_ltp_3m"])]
+        disp["CE Buildup (3m)"] = [classify_buildup(o, p) for o, p in zip(disp["ce_oi_3m"], disp["ce_ltp_3m"])]
+        disp["PE Buildup (3m)"] = [classify_buildup(o, p) for o, p in zip(disp["pe_oi_3m"], disp["pe_ltp_3m"])]
         show_cols = [
             "strike",
             "ce_oi_3m", "ce_oi_3m_pct", "ce_ltp_3m", "CE Buildup (3m)",
@@ -705,13 +722,12 @@ if not hist.empty:
 
         # Telegram alerts
         def maybe_send_alerts():
-            # Rate limit to once per ~3min refresh (based on ts_3m pair)
             key = (str(ts_3m), str(latest_ts))
             if st.session_state.last_alert_ts == key:
                 return
             st.session_state.last_alert_ts = key
 
-            # Build ATM ± near_strikes alert
+            # ATM ± near_strikes alert
             alert_rows = disp[disp["strike"].isin(alert_strikes)].sort_values("strike")
             if not alert_rows.empty:
                 lines = ["<b>ATM±{} OI Update ({} → {})</b>".format(near_strikes, ts_3m.strftime("%H:%M"), latest_ts.strftime("%H:%M")),
@@ -724,7 +740,7 @@ if not hist.empty:
                     )
                 send_telegram(tg_token, tg_chat, "\n".join(lines))
 
-            # Special spike alerts (unique per (ts_3m, latest_ts, strike))
+            # Spike alerts (dedup)
             if not spikes.empty:
                 new_spikes = []
                 for _, r in spikes.iterrows():
@@ -746,7 +762,6 @@ if not hist.empty:
             maybe_send_alerts()
         elif tg_enable:
             st.warning("Telegram enabled but Bot Token / Chat ID missing.")
-
     else:
         st.info("Need a few snapshots to compute 3-minute changes.")
 
