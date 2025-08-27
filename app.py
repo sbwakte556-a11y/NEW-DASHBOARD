@@ -398,6 +398,115 @@ if not wide_latest.empty:
     st.session_state.history_wide = pd.concat([hist, wide_latest], ignore_index=True)
     if len(st.session_state.history_wide) > MAX_HISTORY_POINTS:
         st.session_state.history_wide = st.session_state.history_wide.tail(MAX_HISTORY_POINTS).reset_index(drop=True)
+        # =============== TRENDING OI TAB (history across the day) ===============
+# Adds a new tab where user selects strikes; table keeps ALL prior rows.
+main_tab, trend_tab = st.tabs(["📍 Main", "📊 Trending OI"])
+
+with trend_tab:
+    st.markdown("### 📊 Trending OI — Select strikes and track every refresh (~3 min)")
+    # Helper: pick ATM for default window if available
+    def _infer_atm_for_defaults(df: pd.DataFrame) -> Optional[int]:
+        try:
+            spot_m = float(df["spot"].median()) if df["spot"].notna().any() else np.nan
+            if np.isfinite(spot_m):
+                diffs = (df["strike"] - spot_m).abs()
+                return int(df.loc[diffs.idxmin(), "strike"])
+        except Exception:
+            pass
+        return None
+
+    # Build a list of available strikes from latest snapshot
+    all_strikes = sorted(latest_df["strike"].dropna().unique().tolist())
+    # Default to ATM ± 3 strikes if possible
+    default_sel: List[int] = []
+    _atm0 = _infer_atm_for_defaults(latest_df)
+    if _atm0 is not None:
+        default_sel = [_atm0 + i * STRIKE_STEP for i in range(-3, 4) if (_atm0 + i * STRIKE_STEP) in all_strikes]
+    else:
+        default_sel = all_strikes[:7]
+
+    user_strikes = st.multiselect("Choose strikes to track", options=all_strikes, default=default_sel, key="trending_strikes")
+
+    if not user_strikes:
+        st.info("Select one or more strikes to begin.")
+    else:
+        # Day history only (within market time) to avoid prior sessions
+        def _within_mkt(ts: pd.Timestamp) -> bool:
+            if not isinstance(ts, (pd.Timestamp, dt.datetime)):
+                return False
+            p = pd.Timestamp(ts)
+            t = (p.tz_localize(None).time() if p.tzinfo else p.time())
+            return dt.time(9, 15) <= t <= dt.time(15, 30)
+
+        day_hist = hist[hist["ts"].apply(_within_mkt)]
+        # Keep rows of chosen strikes only
+        dh = day_hist[day_hist["strike"].isin(user_strikes)].copy()
+        if dh.empty:
+            st.warning("No intraday history yet for the selected strikes.")
+        else:
+            # Aggregate by timestamp across selected strikes
+            agg = dh.groupby("ts", as_index=False).agg(
+                ce_oi=("ce_oi", "sum"),
+                pe_oi=("pe_oi", "sum"),
+                ce_ltp=("ce_ltp", "mean"),
+                pe_ltp=("pe_ltp", "mean"),
+            ).sort_values("ts")
+
+            # 3-min (one-interval) changes vs previous stored row
+            agg["ce_oi_delta"] = agg["ce_oi"].diff()
+            agg["pe_oi_delta"] = agg["pe_oi"].diff()
+            agg["ce_px_delta"] = agg["ce_ltp"].diff()
+            agg["pe_px_delta"] = agg["pe_ltp"].diff()
+
+            # Display-friendly columns
+            disp = agg.rename(columns={
+                "ts": "Time",
+                "ce_oi": "Total CE OI",
+                "ce_oi_delta": "Δ CE OI",
+                "ce_px_delta": "Δ CE Price",
+                "pe_oi": "Total PE OI",
+                "pe_oi_delta": "Δ PE OI",
+                "pe_px_delta": "Δ PE Price",
+            })
+            # Round/format a bit
+            for c in ["Total CE OI", "Δ CE OI", "Total PE OI", "Δ PE OI"]:
+                disp[c] = disp[c].round(0).astype("Int64")
+            for c in ["Δ CE Price", "Δ PE Price"]:
+                disp[c] = disp[c].round(2)
+
+            # Row-wise coloring rules:
+            # CE up (OI↑ or Price↑) -> bullish (green); CE down -> bearish (red)
+            # PE up (OI↑ or Price↑) -> bearish (red); PE down -> bullish (green)
+            def _style(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+                def color_row(row):
+                    styles = []
+                    for col in df.columns:
+                        color = ""
+                        if col in ("Δ CE OI", "Δ CE Price"):
+                            v = row[col]
+                            if pd.notna(v):
+                                color = "background-color:#e8f5e9;color:#1b5e20;" if v > 0 else ("background-color:#ffebee;color:#b71c1c;" if v < 0 else "")
+                        if col in ("Δ PE OI", "Δ PE Price"):
+                            v = row[col]
+                            if pd.notna(v):
+                                color = "background-color:#ffebee;color:#b71c1c;" if v > 0 else ("background-color:#e8f5e9;color:#1b5e20;" if v < 0 else "")
+                        styles.append(color)
+                    return styles
+                return df.style.apply(color_row, axis=1)
+
+            st.caption(f"Selected strikes: {', '.join(map(str, user_strikes))}")
+            try:
+                st.dataframe(_style(disp), use_container_width=True)
+            except Exception:
+                st.dataframe(disp, use_container_width=True)
+
+            st.markdown(
+                "<small>Notes: Totals are summed across selected strikes; price change is the mean Δ across those strikes."
+                " Table keeps all prior intervals so you can compare 9:15, 10:00, 12:00, 13:00, etc. Refresh interval = your sidebar setting.</small>",
+                unsafe_allow_html=True,
+            )
+# ============= END TRENDING OI TAB =============
+
 
 # ========================
 # HEADER METRICS & SENTIMENT
@@ -773,4 +882,5 @@ with st.expander("🔎 Raw Latest Snapshot"):
 
 st.markdown("---")
 st.caption("This dashboard fetches NSE option-chain live and refreshes automatically. Intraday trends are from in-session history only. Use with caution.")
+
 
